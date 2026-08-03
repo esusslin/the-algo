@@ -486,6 +486,58 @@ def kill_invite(code: str, admin: dict = Depends(auth.current_admin)) -> dict:
     return {"ok": auth.revoke_invite(code)}
 
 
+@app.post("/api/admin/demo/{action}")
+def demo_data(action: str, admin: dict = Depends(auth.current_admin)) -> dict:
+    """Seed or purge demo data without needing a shell.
+
+    Railway's web console is unreliable, and shelling in to run a script is a
+    bad dependency for something you'll do repeatedly during UI review.
+    """
+    import scripts.seed_demo as demo
+    if action == "seed":
+        return {"history": demo.seed(), "pending": demo.seed_pending()}
+    if action == "purge":
+        return demo.purge()
+    if action == "status":
+        return {
+            "demo_picks": query("SELECT COUNT(*) n FROM picks WHERE demo=1")[0]["n"],
+            "real_picks": query("SELECT COUNT(*) n FROM picks WHERE COALESCE(demo,0)=0")[0]["n"],
+            "demo_bets": query("SELECT COUNT(*) n FROM user_bets WHERE demo=1")[0]["n"],
+        }
+    raise HTTPException(400, "action must be seed, purge or status")
+
+
+@app.post("/api/admin/ingest/{step}")
+def run_ingest(step: str, admin: dict = Depends(auth.current_admin)) -> dict:
+    """Trigger a data-loading step on demand (first-run seeding, debugging)."""
+    from src.fetchers import nflverse, odds_api
+    from src.market.consensus import build_fair_prices
+    from src.picks.generator import generate
+    try:
+        if step == "games":
+            return {"games": nflverse.load_games()}
+        if step == "players":
+            return {"players": nflverse.load_players()}
+        if step == "link":
+            return {"linked": odds_api.link_events()}
+        if step == "poll":
+            return odds_api.poll()
+        if step == "fair":
+            return {"fair_prices": build_fair_prices()}
+        if step == "picks":
+            return generate(source="market_engine")
+        if step == "all":
+            out = {"games": nflverse.load_games(), "players": nflverse.load_players()}
+            out["linked"] = odds_api.link_events()
+            out["poll"] = odds_api.poll()
+            out["fair_prices"] = build_fair_prices()
+            out["picks"] = generate(source="market_engine")["written"]
+            return out
+    except Exception as exc:  # noqa: BLE001 — surface the error to the admin UI
+        raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
+    raise HTTPException(400, "unknown step")
+
+
 @app.get("/api/admin/users")
 def list_users(admin: dict = Depends(auth.current_admin)) -> dict:
     rows = query("SELECT id, username, role, created_at, last_login FROM users "

@@ -277,6 +277,30 @@
 
   <!-- ---- admin ---- -->
   <div x-show="tab==='admin'" class="px-4">
+
+    <div class="card p-4 mb-4">
+      <p class="text-sm mb-1">Data</p>
+      <p class="text-xs text-slate-500 mb-3">Load schedule, odds and picks on demand.</p>
+      <div class="grid grid-cols-2 gap-2">
+        <button @click="ingest('all')" class="py-2 rounded bg-emerald-600 text-white text-xs">Load everything</button>
+        <button @click="ingest('poll')" class="py-2 rounded border border-slate-600 text-xs">Refresh odds</button>
+      </div>
+      <p class="text-xs text-slate-400 mt-3" x-text="busy||ingestMsg"></p>
+    </div>
+
+    <div class="card p-4 mb-4">
+      <p class="text-sm mb-1">Demo data</p>
+      <p class="text-xs text-slate-500 mb-3">
+        Placeholder picks and history for UI feedback. Flagged and excluded from
+        the real record.
+      </p>
+      <div class="grid grid-cols-2 gap-2">
+        <button @click="demo('seed')" class="py-2 rounded border border-fuchsia-700 text-fuchsia-300 text-xs">Seed demo</button>
+        <button @click="demo('purge')" class="py-2 rounded border border-slate-600 text-xs">Purge demo</button>
+      </div>
+      <p class="text-xs text-slate-400 mt-3" x-text="demoMsg"></p>
+    </div>
+
     <button @click="newInvite()" class="w-full py-3 rounded bg-emerald-600 text-white text-sm mb-4">
       Create invite
     </button>
@@ -318,6 +342,7 @@ function algo(){return{
   token:localStorage.getItem('algo_token')||'', user:{}, tab:'picks', scope:'mine',
   filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[], algo:{},
   form:{username:'',password:''}, error:'', fresh:'', inviteCode:'', inviteValid:false, inviteReason:'',
+  busy:'', ingestMsg:'', demoMsg:'',
 
   async boot(){
     const q=new URLSearchParams(location.search); this.inviteCode=q.get('invite')||'';
@@ -384,6 +409,24 @@ function algo(){return{
     await fetch('/api/bets',{method:'POST',headers:this.hdr(),
       body:JSON.stringify({pick_id:p.pick_id,price:parseInt(price),stake:parseFloat(stake),book:p.best_book})});
     p.i_bet_this=true;
+  },
+  async ingest(step){
+    this.busy='Working… this can take a minute.'; this.ingestMsg='';
+    try{
+      const r=await fetch('/api/admin/ingest/'+step,{method:'POST',headers:this.hdr()});
+      const d=await r.json();
+      this.ingestMsg = r.ok ? JSON.stringify(d) : ('Failed: '+(d.detail||r.status));
+    }catch(e){ this.ingestMsg='Failed: '+e.message }
+    this.busy=''; await this.refresh();
+  },
+  async demo(action){
+    this.demoMsg='Working…';
+    try{
+      const r=await fetch('/api/admin/demo/'+action,{method:'POST',headers:this.hdr()});
+      const d=await r.json();
+      this.demoMsg = r.ok ? JSON.stringify(d) : ('Failed: '+(d.detail||r.status));
+    }catch(e){ this.demoMsg='Failed: '+e.message }
+    await this.refresh();
   },
   async newInvite(){
     const note=prompt('Who is this for?')||'';
