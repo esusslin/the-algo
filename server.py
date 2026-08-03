@@ -57,6 +57,9 @@ def _poll_odds() -> None:
     if result.get("written"):
         with job_run("build_fair_prices") as ctx:
             ctx["rows_affected"] = build_fair_prices()
+        with job_run("generate_picks") as ctx:
+            from src.picks.generator import generate
+            ctx["rows_affected"] = generate(source="market_engine")["written"]
 
 
 def _link_odds_events() -> None:
@@ -228,6 +231,26 @@ def stats() -> dict:
         except Exception:  # noqa: BLE001
             out[table] = None
     return out
+
+
+@app.get("/api/picks")
+def picks(include_dark: bool = False) -> dict:
+    """Current slate. `include_dark` exposes unpublished model picks (admin)."""
+    from src.picks.generator import current_slate
+    rows = current_slate(include_unpublished=include_dark)
+    return {
+        "count": len(rows),
+        "by_tier": {t: sum(1 for r in rows if r["tier"] == t) for t in ("A", "B", "C")},
+        "picks": rows,
+    }
+
+
+@app.get("/api/edges")
+def edges(min_edge: float = 2.0) -> dict:
+    """Raw opportunity list before tiering — the admin/debug view."""
+    from src.market.shop import find_opportunities
+    opps = find_opportunities(min_edge=min_edge)
+    return {"count": len(opps), "min_edge": min_edge, "edges": opps[:100]}
 
 
 @app.post("/api/admin/run/{job_id}")
