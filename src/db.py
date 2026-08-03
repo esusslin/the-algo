@@ -505,6 +505,27 @@ MIGRATIONS: list[tuple[int, str]] = [
         PRIMARY KEY (game_id, player_id, stat_key)
     );
     """),
+
+    (5, """
+    -- Demo rows exist so testers can see a populated Track/History before any
+    -- real bet has settled. They are flagged so they can NEVER contaminate the
+    -- real record: every history query excludes demo=1 unless asked otherwise,
+    -- and `seed_demo.py purge` removes them completely.
+    ALTER TABLE picks ADD COLUMN demo INTEGER DEFAULT 0;
+    ALTER TABLE user_bets ADD COLUMN demo INTEGER DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS idx_picks_demo ON picks(demo);
+
+    -- delivery log for invites (SMS or link)
+    CREATE TABLE IF NOT EXISTS invite_sends (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        code       TEXT,
+        channel    TEXT,
+        recipient  TEXT,
+        status     TEXT,
+        error      TEXT,
+        sent_at    TEXT
+    );
+    """),
 ]
 
 

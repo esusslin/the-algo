@@ -102,8 +102,13 @@ def _decorate(rows: list[dict]) -> list[dict]:
 # public API
 # --------------------------------------------------------------------------
 def overall_history(filt: str = "all", season: int | None = None,
-                    week: int | None = None, limit: int = 500) -> dict[str, Any]:
-    """Every pick the app generated, with filterable aggregates."""
+                    week: int | None = None, limit: int = 500,
+                    include_demo: bool = False) -> dict[str, Any]:
+    """Every pick the app generated, with filterable aggregates.
+
+    Demo rows are excluded by default and must be opted into explicitly — a
+    seeded fake win must never be able to inflate the real track record.
+    """
     sql = (
         "SELECT p.*, g.season, g.week, g.home_team, g.away_team, g.kickoff_utc, "
         "       g.home_score, g.away_score, pl.full_name AS player_name, "
@@ -114,6 +119,8 @@ def overall_history(filt: str = "all", season: int | None = None,
         "WHERE 1=1"
     )
     params: list = []
+    if not include_demo:
+        sql += " AND COALESCE(p.demo,0)=0"
     if season:
         sql += " AND g.season=?"
         params.append(season)
@@ -140,7 +147,8 @@ def overall_history(filt: str = "all", season: int | None = None,
     }
 
 
-def user_history(user_id: int, filt: str = "all", limit: int = 500) -> dict[str, Any]:
+def user_history(user_id: int, filt: str = "all", limit: int = 500,
+                 include_demo: bool = False) -> dict[str, Any]:
     """Only bets this user opted into, at the price they actually got."""
     sql = (
         "SELECT b.id AS bet_id, b.stake, b.price, b.book, b.placed_at, b.result, "
@@ -154,7 +162,9 @@ def user_history(user_id: int, filt: str = "all", limit: int = 500) -> dict[str,
         "JOIN picks p ON p.pick_id = b.pick_id "
         "JOIN games g ON g.game_id = p.game_id "
         "LEFT JOIN players pl ON pl.player_id = p.player_id "
-        "WHERE b.user_id=? ORDER BY b.placed_at DESC"
+        "WHERE b.user_id=?"
+        + ("" if include_demo else " AND COALESCE(b.demo,0)=0")
+        + " ORDER BY b.placed_at DESC"
     )
     rows = [dict(r) for r in query(sql, (user_id,))]
     filtered = _rows_for_filter(rows, filt)

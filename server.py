@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -284,6 +284,7 @@ class BetBody(BaseModel):
 
 class InviteBody(BaseModel):
     note: str = ""
+    phone: str | None = None      # if set, texts the link via Twilio
 
 
 @app.post("/api/auth/login")
@@ -433,8 +434,45 @@ def live(user: dict = Depends(auth.current_user)) -> dict:
 # admin
 # ==========================================================================
 @app.post("/api/admin/invites")
-def make_invite(body: InviteBody, admin: dict = Depends(auth.current_admin)) -> dict:
-    return auth.create_invite(admin["id"], note=body.note)
+def make_invite(request: Request, body: InviteBody,
+                admin: dict = Depends(auth.current_admin)) -> dict:
+    inv = auth.create_invite(admin["id"], note=body.note)
+    inv["link"] = f"{str(request.base_url).rstrip('/')}/app?invite={inv['code']}"
+    if body.phone:
+        from src.notify.sms import send_invite
+        inv["sms"] = send_invite(inv["code"], body.phone,
+                                 str(request.base_url), inviter=admin["username"])
+    return inv
+
+
+@app.get("/api/admin/sms-status")
+def sms_status(admin: dict = Depends(auth.current_admin)) -> dict:
+    from src.notify.sms import configured
+    recent = query("SELECT * FROM invite_sends ORDER BY id DESC LIMIT 20")
+    return {"configured": configured(), "enabled": settings.ENABLE_SMS,
+            "recent": [dict(r) for r in recent]}
+
+
+@app.get("/api/algorithm")
+def algorithm(user: dict = Depends(auth.current_user)) -> dict:
+    """How picks are calculated — the explanation shown in the Algorithm tab."""
+    from src.picks.generator import TIER_RULES
+    return {
+        "tier_rules": TIER_RULES,
+        "config": {
+            "min_edge_pct": settings.MIN_EDGE_PCT,
+            "kelly_fraction": settings.KELLY_FRACTION,
+            "max_bet_pct_bankroll": settings.MAX_BET_PCT_BANKROLL,
+            "devig_method": settings.DEVIG_METHOD,
+            "sharp_books": settings.SHARP_BOOKS,
+            "bettable_books": settings.BETTABLE_BOOKS,
+        },
+        "flags": {
+            "publish_model_picks": settings.PUBLISH_MODEL_PICKS,
+            "props": settings.ENABLE_PROPS,
+            "simulator": settings.ENABLE_SIMULATOR,
+        },
+    }
 
 
 @app.get("/api/admin/invites")

@@ -61,7 +61,8 @@
       </button>
     </div>
 
-    <div class="flex gap-2 mt-3 overflow-x-auto no-scrollbar" x-show="tab!=='track'">
+    <div class="flex gap-2 mt-3 overflow-x-auto no-scrollbar"
+         x-show="tab==='picks'||tab==='track'">
       <template x-for="f in filters" :key="f.key">
         <button @click="filter=f.key; refresh()"
                 class="chip px-3 py-1.5 rounded-full text-xs whitespace-nowrap"
@@ -180,6 +181,99 @@
     </div>
   </div>
 
+  <!-- ---- algorithm ---- -->
+  <div x-show="tab==='algo'" class="px-4 space-y-3 text-[13px] leading-relaxed">
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">What this does</p>
+      <p class="text-slate-400">
+        It compares the price at every sportsbook against a best estimate of the
+        true probability, and flags the cases where a book is paying more than
+        the outcome is worth. It is not predicting who wins — it is finding
+        prices that disagree with the rest of the market.
+      </p>
+    </div>
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">How a pick is made</p>
+      <ol class="text-slate-400 space-y-2 list-decimal ml-4">
+        <li>Pull odds from ~23 books, every few minutes, faster near kickoff.</li>
+        <li><span class="text-slate-200">Remove the vig.</span> Posted odds add up
+            to more than 100% — that gap is the book's margin. We strip it per
+            book to get a fair probability.</li>
+        <li><span class="text-slate-200">Anchor on the sharp book.</span> Pinnacle
+            takes big bets and doesn't limit winners, so its price is the closest
+            thing to truth. Where it's available, it sets fair value rather than
+            an average that includes the book we'd be betting into.</li>
+        <li><span class="text-slate-200">Shop every book</span> for the best
+            available number on that same bet.</li>
+        <li>Edge = what we'd be paid, minus what it's worth.</li>
+        <li>Size it with fractional Kelly, then cut it back for correlation.</li>
+      </ol>
+    </div>
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">Tiers</p>
+      <p class="text-slate-400 mb-3">Four gates. A pick must clear all of them.</p>
+      <template x-for="(r,t) in algo.tier_rules||{}" :key="t">
+        <div class="flex items-center gap-3 py-1.5 border-t border-slate-800">
+          <span class="text-[11px] px-1.5 py-0.5 rounded shrink-0"
+                :class="t==='A'?'bg-emerald-900 text-emerald-300':t==='B'?'bg-indigo-900 text-indigo-300':'bg-slate-700 text-slate-300'"
+                x-text="t"></span>
+          <span class="text-slate-400 text-xs"
+                x-text="'edge ≥'+r.min_edge+'% · '+r.min_books+'+ books'
+                  +(r.require_sharp?' · sharp anchor':'')
+                  +(r.max_dispersion<1?' · books agree within '+(r.max_dispersion*100).toFixed(0)+'%':'')"></span>
+        </div>
+      </template>
+      <p class="text-slate-500 text-xs mt-3">
+        Book count proves the market is real, not one stale price. Dispersion is
+        how much the books disagree — a big edge against a scattered market
+        usually means we're the ones who are wrong.
+      </p>
+    </div>
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">Why CLV matters more than wins</p>
+      <p class="text-slate-400">
+        Over a few hundred bets, win rate is mostly luck — you can be genuinely
+        good and still finish down. Closing line value measures whether you got a
+        better number than the market settled on. It's the thing that shows up
+        first, and profit follows it. Judge the system on CLV.
+      </p>
+    </div>
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">What it doesn't do</p>
+      <ul class="text-slate-400 space-y-1.5 list-disc ml-4">
+        <li>No AI is guessing at scores. Language models are bad at numbers; the
+            probabilities come from statistics, not chat.</li>
+        <li>It won't find edges every day. Main spreads and totals are among the
+            most efficiently priced markets in the world — an empty list is
+            usually the honest answer.</li>
+        <li>It can't see everything. A coach announcing a snap count on Friday
+            isn't in any dataset.</li>
+      </ul>
+    </div>
+
+    <div class="card p-4">
+      <p class="text-sm mb-2">Current settings</p>
+      <div class="grid grid-cols-2 gap-y-2 text-xs text-slate-400">
+        <span>Minimum edge</span><span class="text-slate-200" x-text="(algo.config?.min_edge_pct??'—')+'%'"></span>
+        <span>Kelly fraction</span><span class="text-slate-200" x-text="algo.config?.kelly_fraction??'—'"></span>
+        <span>Max bet</span><span class="text-slate-200" x-text="(algo.config?.max_bet_pct_bankroll??'—')+'% of bankroll'"></span>
+        <span>Vig removal</span><span class="text-slate-200" x-text="algo.config?.devig_method??'—'"></span>
+        <span>Sharp book</span><span class="text-slate-200" x-text="(algo.config?.sharp_books||[]).join(', ')"></span>
+        <span>Player props</span><span class="text-slate-200" x-text="algo.flags?.props?'on':'off — coming week 4'"></span>
+      </div>
+    </div>
+
+    <p class="text-slate-600 text-xs pb-4">
+      Informational only, not financial advice. No outcome is guaranteed. 21+.
+      If betting stops being fun, take a break — 1-800-GAMBLER.
+    </p>
+  </div>
+
   <!-- ---- admin ---- -->
   <div x-show="tab==='admin'" class="px-4">
     <button @click="newInvite()" class="w-full py-3 rounded bg-emerald-600 text-white text-sm mb-4">
@@ -210,6 +304,8 @@
             :class="tab==='picks'?'text-emerald-400':'text-slate-500'">Picks</button>
     <button @click="tab='track'; refresh()" class="flex-1 py-3 text-xs"
             :class="tab==='track'?'text-emerald-400':'text-slate-500'">Track</button>
+    <button @click="tab='algo'; refresh()" class="flex-1 py-3 text-xs"
+            :class="tab==='algo'?'text-emerald-400':'text-slate-500'">Algorithm</button>
     <button x-show="user.role==='admin'" @click="tab='admin'; refresh()"
             class="flex-1 py-3 text-xs"
             :class="tab==='admin'?'text-emerald-400':'text-slate-500'">Admin</button>
@@ -219,7 +315,7 @@
 <script>
 function algo(){return{
   token:localStorage.getItem('algo_token')||'', user:{}, tab:'picks', scope:'mine',
-  filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[],
+  filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[], algo:{},
   form:{username:'',password:''}, error:'', fresh:'', inviteCode:'', inviteValid:false, inviteReason:'',
 
   async boot(){
@@ -269,6 +365,9 @@ function algo(){return{
       const d=await(await fetch('/api/history/'+this.scope+'?filter='+this.filter,{headers:this.hdr()})).json();
       this.hist=d;
     }
+    if(this.tab==='algo'){
+      this.algo=await(await fetch('/api/algorithm',{headers:this.hdr()})).json();
+    }
     if(this.tab==='admin'){
       const d=await(await fetch('/api/admin/invites',{headers:this.hdr()})).json();
       this.invites=d.invites||[];
@@ -287,7 +386,12 @@ function algo(){return{
   },
   async newInvite(){
     const note=prompt('Who is this for?')||'';
-    await fetch('/api/admin/invites',{method:'POST',headers:this.hdr(),body:JSON.stringify({note})});
+    const phone=prompt('Text it to them? Enter a phone number, or leave blank for a link only.')||'';
+    const r=await(await fetch('/api/admin/invites',{method:'POST',headers:this.hdr(),
+      body:JSON.stringify({note,phone:phone||null})})).json();
+    if(r.sms) alert(r.sms.status==='sent' ? 'Texted to '+r.sms.to
+      : 'Not texted ('+(r.sms.error||'unknown')+').\nLink:\n'+r.link);
+    else { navigator.clipboard?.writeText(r.link); alert('Link copied:\n'+r.link); }
     await this.refresh();
   },
   copyInvite(code){
@@ -296,13 +400,14 @@ function algo(){return{
   },
 
   fmtOdds(p){return p>0?'+'+p:''+p},
-  tabTitle(){return this.tab==='picks'?'Picks':this.tab==='track'?'Track':'Admin'},
+  tabTitle(){return {picks:'Picks',track:'Track',algo:'Algorithm',admin:'Admin'}[this.tab]},
   subtitle(){
     if(this.tab==='picks'){
       const a=this.picks.filter(p=>p.tier==='A').length, b=this.picks.filter(p=>p.tier==='B').length;
       return this.picks.length ? a+' A-tier · '+b+' B-tier' : 'nothing clearing threshold';
     }
     if(this.tab==='track')return (this.live.live||0)+' live · '+(this.live.open||0)+' open';
+    if(this.tab==='algo')return 'how picks are calculated';
     return this.invites.length+' invites';
   },
 }}
