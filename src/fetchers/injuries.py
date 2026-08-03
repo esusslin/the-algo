@@ -205,28 +205,97 @@ def parse_espn(items: Iterable[dict], team: str, week: int | None,
 # --------------------------------------------------------------------------
 # id resolution — never fuzzy-match silently
 # --------------------------------------------------------------------------
-def resolve_player_ids(records: list[InjuryRecord]) -> tuple[list[InjuryRecord], int]:
+_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def norm_name(name: str) -> str:
+    """Aggressively normalize a player name for cross-source matching.
+
+    Sleeper only carries gsis_id for a minority of players, so name matching does
+    most of the work and the sources disagree constantly:
+        "D.K. Metcalf" / "DK Metcalf" / "D K Metcalf"
+        "Odell Beckham Jr." / "Odell Beckham"
+        "Amon-Ra St. Brown" / "Amon Ra St Brown"
+    """
+    s = name.lower().strip()
+    s = s.replace("'", "").replace("`", "").replace("’", "")
+    s = s.replace(".", " ").replace("-", " ").replace(",", " ")
+    parts = [p for p in s.split() if p]
+    while parts and parts[-1].rstrip(".") in _SUFFIXES:
+        parts.pop()
+    # Collapse runs of single-letter initials: "d k metcalf" -> "dk metcalf",
+    # so "D.K. Metcalf" and "DK Metcalf" land on the same key.
+    merged: list[str] = []
+    for p in parts:
+        if len(p) == 1 and merged and len(merged[-1]) <= 2 and merged[-1].isalpha() \
+                and len(merged) == 1:
+            merged[-1] += p
+        else:
+            merged.append(p)
+    return " ".join(merged)
+
+
+def _name_index() -> dict[str, list[tuple[str, str | None]]]:
+    """normalized name -> [(player_id, team), ...].
+
+    The players table holds ~25k names going back decades, so collisions are
+    common and real (Marvin Harrison Sr. and Jr. normalize identically). We keep
+    every candidate plus its team so `resolve_player_ids` can disambiguate on
+    team rather than guessing.
+    """
+    idx: dict[str, list[tuple[str, str | None]]] = {}
+    for r in query("SELECT player_id, full_name, team FROM players WHERE full_name IS NOT NULL"):
+        idx.setdefault(norm_name(r["full_name"]), []).append((r["player_id"], r["team"]))
+    for r in query("SELECT alias, player_id FROM player_aliases WHERE player_id IS NOT NULL"):
+        idx.setdefault(norm_name(r["alias"]), []).append((r["player_id"], None))
+    return idx
+
+
+def resolve_player_ids(records: list[InjuryRecord]) -> tuple[list[InjuryRecord], dict]:
     """Map source-native ids/names onto canonical gsis player_id.
 
-    Anything unresolved keeps its prefixed source id (e.g. `sleeper:1234`) and is
-    counted. Quarantine, don't guess: a wrong match is worse than a missing one.
+    Quarantine, don't guess. A wrong match silently corrupts every prop for that
+    player, which is far worse than a missing row. Ambiguous names (two players
+    normalize identically) are left unresolved and reported.
     """
-    by_name: dict[str, str] = {}
-    for r in query("SELECT player_id, full_name FROM players WHERE full_name IS NOT NULL"):
-        by_name.setdefault(r["full_name"].strip().lower(), r["player_id"])
-    for r in query("SELECT alias, player_id FROM player_aliases WHERE player_id IS NOT NULL"):
-        by_name.setdefault(r["alias"].strip().lower(), r["player_id"])
+    idx = _name_index()
+    if not idx:
+        log.warning(
+            "players table is empty — run `python -m src.fetchers.nflverse players` "
+            "first or nothing will resolve"
+        )
 
-    unresolved = 0
+    stats = {"total": len(records), "native_gsis": 0, "by_name": 0,
+             "by_name_team": 0, "ambiguous": 0, "unresolved": 0}
+    unresolved_names: list[str] = []
+
     for rec in records:
         if rec.player_id and not rec.player_id.startswith(("sleeper:", "espn:")):
+            stats["native_gsis"] += 1
             continue
-        hit = by_name.get(rec.player_name.strip().lower())
-        if hit:
-            rec.player_id = hit
-        else:
-            unresolved += 1
-    return records, unresolved
+
+        candidates = idx.get(norm_name(rec.player_name), [])
+        if not candidates:
+            stats["unresolved"] += 1
+            unresolved_names.append(rec.player_name)
+            continue
+        if len(candidates) == 1:
+            rec.player_id = candidates[0][0]
+            stats["by_name"] += 1
+            continue
+
+        # Ambiguous by name — disambiguate on current team before giving up.
+        if rec.team:
+            on_team = [pid for pid, team in candidates if team and team == rec.team]
+            if len(on_team) == 1:
+                rec.player_id = on_team[0]
+                stats["by_name_team"] += 1
+                continue
+        stats["ambiguous"] += 1          # keep the source id; never guess
+        unresolved_names.append(f"{rec.player_name} (ambiguous x{len(candidates)})")
+
+    stats["unresolved_sample"] = unresolved_names[:15]
+    return records, stats
 
 
 # --------------------------------------------------------------------------
@@ -258,7 +327,14 @@ def current_week() -> tuple[int, int | None]:
 # --------------------------------------------------------------------------
 # entry point used by the scheduler
 # --------------------------------------------------------------------------
-def refresh(use_espn: bool = True) -> int:
+def refresh(use_espn: bool = False) -> int:
+    """Pull current injury state from all enabled sources.
+
+    ESPN defaults OFF: as of the Aug 2026 probe its team injuries endpoint returns
+    an empty object (official reports don't exist until practice weeks begin).
+    It costs 32 HTTP calls per run for zero rows. Re-probe in September and flip
+    this on if it populates.
+    """
     season, week = current_week()
     records: list[InjuryRecord] = []
 
@@ -283,18 +359,22 @@ def refresh(use_espn: bool = True) -> int:
                 got += len(parsed)
         log.info("espn: %d injury records across %d teams", got, len(teams))
 
-    records, unresolved = resolve_player_ids(records)
+    records, stats = resolve_player_ids(records)
     n = store(records)
 
+    detail = (f"{n} rows | gsis={stats['native_gsis']} name={stats['by_name']} "
+              f"name+team={stats['by_name_team']} ambiguous={stats['ambiguous']} "
+              f"unresolved={stats['unresolved']}")
     with db() as conn:
         conn.execute(
             "INSERT INTO source_freshness (source, last_success, remote_stamp, detail) "
             "VALUES (?,?,?,?) ON CONFLICT(source) DO UPDATE SET "
             "last_success=excluded.last_success, detail=excluded.detail",
-            ("injuries", utcnow(), None, f"{n} rows, {unresolved} unresolved ids"),
+            ("injuries", utcnow(), None, detail),
         )
-    if unresolved:
-        log.warning("%d injury records could not be resolved to a gsis id", unresolved)
+    log.info("injuries: %s", detail)
+    if stats["unresolved"] or stats["ambiguous"]:
+        log.warning("unresolved sample: %s", ", ".join(stats["unresolved_sample"]))
     return n
 
 
@@ -316,10 +396,32 @@ def probe() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"  FAIL {exc}")
 
-    print("\n=== ESPN (best-effort) ===")
-    for t in ("kc", "buf", "phi"):
-        items = fetch_espn_team(t)
-        print(f"  {t}: {len(items)} items" if items else f"  {t}: no data / endpoint changed")
+    print("\n=== name normalization ===")
+    for a, b in [("D.K. Metcalf", "DK Metcalf"),
+                 ("Odell Beckham Jr.", "Odell Beckham"),
+                 ("Amon-Ra St. Brown", "Amon Ra St Brown"),
+                 ("Ja'Marr Chase", "JaMarr Chase")]:
+        ok = "OK  " if norm_name(a) == norm_name(b) else "FAIL"
+        print(f"  {ok} {a!r} == {b!r}  ->  {norm_name(a)!r}")
+
+    print("\n=== ESPN — raw shape (parser is wrong; this tells us the real one) ===")
+    import json as _json
+    for t in ("kc",):
+        url = ESPN_TEAM_INJURIES.format(team=t)
+        try:
+            with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as c:
+                r = c.get(url)
+            print(f"  {url}\n  status={r.status_code} bytes={len(r.content)}")
+            data = r.json()
+            print(f"  top-level keys: {list(data)[:12]}")
+            for k, v in list(data.items())[:6]:
+                kind = type(v).__name__
+                size = f"[{len(v)}]" if isinstance(v, (list, dict)) else ""
+                print(f"    {k}: {kind}{size}")
+            blob = _json.dumps(data)[:700]
+            print(f"  sample: {blob}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL {exc}")
 
 
 if __name__ == "__main__":
