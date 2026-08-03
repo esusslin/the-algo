@@ -310,6 +310,17 @@ def register(body: RegisterBody) -> dict:
         user = auth.redeem_invite(body.invite, body.username, body.password, body.phone)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+    # If demo data is loaded, give the new tester their own copy immediately.
+    # Otherwise they open Track to an empty My History while everyone else has
+    # one, and report it as a bug on their first minute in the app.
+    if _demo_exists():
+        try:
+            import scripts.seed_demo as demo
+            demo.backfill_users()
+        except Exception as exc:  # noqa: BLE001 — never fail a signup over demo data
+            log.warning("demo backfill on register failed: %s", exc)
+
     return {
         "token": auth.create_token(user["user_id"], user["username"], user["role"]),
         "user": user,
