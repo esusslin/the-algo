@@ -460,6 +460,51 @@ MIGRATIONS: list[tuple[int, str]] = [
     );
     CREATE INDEX IF NOT EXISTS idx_ai_created ON ai_calls(created_at);
     """),
+
+    (4, """
+    -- ============ invites ============
+    CREATE TABLE IF NOT EXISTS invites (
+        code        TEXT PRIMARY KEY,
+        created_by  INTEGER,
+        note        TEXT,
+        created_at  TEXT,
+        expires_at  TEXT,
+        used_by     INTEGER,
+        used_at     TEXT,
+        revoked     INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_invites_open ON invites(used_by, revoked);
+
+    -- ============ grading + CLV on user bets ============
+    ALTER TABLE user_bets ADD COLUMN closing_price INTEGER;
+    ALTER TABLE user_bets ADD COLUMN clv_pct REAL;
+    ALTER TABLE user_bets ADD COLUMN payout REAL;
+    ALTER TABLE user_bets ADD COLUMN graded_at TEXT;
+    ALTER TABLE user_bets ADD COLUMN note TEXT;
+
+    -- ============ live game state (for the in-progress Track view) ============
+    CREATE TABLE IF NOT EXISTS live_state (
+        game_id      TEXT PRIMARY KEY,
+        home_score   INTEGER,
+        away_score   INTEGER,
+        period       INTEGER,
+        clock        TEXT,
+        status       TEXT,
+        possession   TEXT,
+        home_win_prob REAL,
+        updated_at   TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS live_player_stats (
+        game_id     TEXT,
+        player_id   TEXT,
+        player_name TEXT,
+        stat_key    TEXT,
+        value       REAL,
+        updated_at  TEXT,
+        PRIMARY KEY (game_id, player_id, stat_key)
+    );
+    """),
 ]
 
 

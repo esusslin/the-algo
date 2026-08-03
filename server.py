@@ -15,13 +15,17 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
+from src import auth
 from src.config import settings
-from src.db import db, job_run, query, run_migrations, utcnow
+from src.db import db, insert_row, job_run, query, run_migrations, utcnow
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -30,6 +34,7 @@ logging.basicConfig(
 log = logging.getLogger("the-algo")
 
 scheduler = BackgroundScheduler(timezone=settings.TZ)
+TEMPLATES = Path(__file__).parent / "templates"
 
 
 # ==========================================================================
@@ -124,6 +129,15 @@ async def lifespan(app: FastAPI):
     if problems and settings.IS_PROD:
         log.error("starting with %d config problems — fix these", len(problems))
 
+    try:
+        from src.teams import seed_teams_table
+        seed_teams_table()
+        admin_id = auth.bootstrap_admin()
+        if admin_id:
+            log.info("admin user ready (id=%s)", admin_id)
+    except Exception as exc:  # noqa: BLE001 — never block startup on seeding
+        log.error("startup seeding failed: %s", exc)
+
     register_jobs()
     scheduler.start()
     log.info("scheduler started (tz=%s)", settings.TZ)
@@ -216,9 +230,21 @@ def health() -> JSONResponse:
     )
 
 
-@app.get("/")
-def root() -> dict:
-    return {"service": "the-algo", "status": "up", "docs": "/docs", "health": "/health"}
+@app.get("/", response_class=HTMLResponse)
+@app.get("/app", response_class=HTMLResponse)
+def app_page() -> HTMLResponse:
+    return HTMLResponse((TEMPLATES / "app.html").read_text(encoding="utf-8"))
+
+
+@app.get("/static/manifest.json")
+def manifest() -> dict:
+    """PWA manifest — lets iOS/Android 'add to home screen' run it fullscreen."""
+    return {
+        "name": "The Algo", "short_name": "Algo",
+        "start_url": "/app", "display": "standalone",
+        "background_color": "#0b0f14", "theme_color": "#0b0f14",
+        "icons": [],
+    }
 
 
 @app.get("/api/stats")
@@ -233,16 +259,199 @@ def stats() -> dict:
     return out
 
 
-@app.get("/api/picks")
-def picks(include_dark: bool = False) -> dict:
-    """Current slate. `include_dark` exposes unpublished model picks (admin)."""
-    from src.picks.generator import current_slate
-    rows = current_slate(include_unpublished=include_dark)
+# ==========================================================================
+# auth
+# ==========================================================================
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class RegisterBody(BaseModel):
+    invite: str
+    username: str
+    password: str
+    phone: str | None = None
+
+
+class BetBody(BaseModel):
+    pick_id: int
+    book: str | None = None
+    price: int | None = None
+    stake: float | None = None
+    note: str | None = None
+
+
+class InviteBody(BaseModel):
+    note: str = ""
+
+
+@app.post("/api/auth/login")
+def login(body: LoginBody) -> dict:
+    user = auth.authenticate(body.username, body.password)
+    if not user:
+        raise HTTPException(401, "invalid username or password")
     return {
-        "count": len(rows),
-        "by_tier": {t: sum(1 for r in rows if r["tier"] == t) for t in ("A", "B", "C")},
-        "picks": rows,
+        "token": auth.create_token(user["id"], user["username"], user["role"]),
+        "user": {"id": user["id"], "username": user["username"], "role": user["role"]},
     }
+
+
+@app.get("/api/auth/invite/{code}")
+def check_invite(code: str) -> dict:
+    ok, reason = auth.check_invite(code)
+    return {"valid": ok, "reason": reason}
+
+
+@app.post("/api/auth/register")
+def register(body: RegisterBody) -> dict:
+    try:
+        user = auth.redeem_invite(body.invite, body.username, body.password, body.phone)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "token": auth.create_token(user["user_id"], user["username"], user["role"]),
+        "user": user,
+    }
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(auth.current_user)) -> dict:
+    return {"id": user["id"], "username": user["username"], "role": user["role"],
+            "sms_opt_in": user["sms_opt_in"]}
+
+
+# ==========================================================================
+# picks, bets, history
+# ==========================================================================
+@app.get("/api/picks")
+def picks(filter: str = "all", user: dict = Depends(auth.current_user)) -> dict:
+    """Current slate, filterable by bet type."""
+    from src.markets import describe_market, matches_filter, side_label
+    from src.picks.generator import current_slate
+
+    include_dark = user["role"] == "admin"
+    rows = current_slate(include_unpublished=include_dark)
+
+    mine = {r["pick_id"] for r in query(
+        "SELECT pick_id FROM user_bets WHERE user_id=?", (user["id"],))}
+    games = {r["game_id"]: r for r in query(
+        "SELECT game_id, home_team, away_team, kickoff_utc FROM games")}
+    names = {r["player_id"]: r["full_name"] for r in query(
+        "SELECT player_id, full_name FROM players WHERE full_name IS NOT NULL")}
+
+    out = []
+    for r in rows:
+        if not matches_filter(r["market_type"], filter):
+            continue
+        info = describe_market(r["market_type"])
+        g = games.get(r["game_id"], {})
+        out.append({
+            **r,
+            "market_label": info.label,
+            "bet_class": info.bet_class,
+            "description": side_label(r["market_type"], r["side"], r["line"] or 0,
+                                      g.get("home_team", ""), g.get("away_team", ""),
+                                      names.get(r["player_id"], "")),
+            "matchup": f"{g.get('away_team','')} @ {g.get('home_team','')}",
+            "kickoff_utc": g.get("kickoff_utc"),
+            "i_bet_this": r["pick_id"] in mine,
+        })
+    return {
+        "count": len(out),
+        "by_tier": {t: sum(1 for r in out if r["tier"] == t) for t in ("A", "B", "C")},
+        "picks": out,
+    }
+
+
+@app.post("/api/bets")
+def log_bet(body: BetBody, user: dict = Depends(auth.current_user)) -> dict:
+    """Log that you took a pick, at the price YOU actually got.
+
+    Defaults to the recommended book/price/stake, but the whole point of the
+    edit is honesty: logging the recommended price when you got a worse one
+    flatters your CLV and defeats the tracking.
+    """
+    pick = query("SELECT * FROM picks WHERE pick_id=?", (body.pick_id,))
+    if not pick:
+        raise HTTPException(404, "pick not found")
+    p = pick[0]
+    dup = query("SELECT id FROM user_bets WHERE user_id=? AND pick_id=?",
+                (user["id"], body.pick_id))
+    if dup:
+        raise HTTPException(409, "already logged this pick")
+    with db() as conn:
+        bet_id = insert_row(conn, "user_bets", {
+            "user_id": user["id"], "pick_id": body.pick_id,
+            "book": body.book or p["best_book"],
+            "price": body.price if body.price is not None else p["best_price"],
+            "stake": body.stake if body.stake is not None else p["kelly_units"],
+            "placed_at": utcnow(), "result": "pending", "note": body.note,
+        })
+    return {"ok": True, "bet_id": bet_id}
+
+
+@app.delete("/api/bets/{bet_id}")
+def unlog_bet(bet_id: int, user: dict = Depends(auth.current_user)) -> dict:
+    with db() as conn:
+        cur = conn.execute("DELETE FROM user_bets WHERE id=? AND user_id=? "
+                           "AND result='pending'", (bet_id, user["id"]))
+    return {"ok": cur.rowcount > 0}
+
+
+@app.get("/api/history/overall")
+def history_overall(filter: str = "all", season: int | None = None,
+                    week: int | None = None,
+                    user: dict = Depends(auth.current_user)) -> dict:
+    from src.picks.history import overall_history
+    return overall_history(filter, season=season, week=week)
+
+
+@app.get("/api/history/mine")
+def history_mine(filter: str = "all",
+                 user: dict = Depends(auth.current_user)) -> dict:
+    from src.picks.history import user_history
+    return user_history(user["id"], filter)
+
+
+@app.get("/api/history/filters")
+def history_filters(user: dict = Depends(auth.current_user)) -> dict:
+    from src.markets import PRIMARY_FILTERS, SECONDARY_FILTERS
+    from src.picks.history import filter_options
+    return {"options": filter_options(),
+            "primary": PRIMARY_FILTERS, "secondary": SECONDARY_FILTERS}
+
+
+@app.get("/api/live")
+def live(user: dict = Depends(auth.current_user)) -> dict:
+    """In-progress state for this user's open bets."""
+    from src.picks.live import open_bet_status
+    return open_bet_status(user["id"])
+
+
+# ==========================================================================
+# admin
+# ==========================================================================
+@app.post("/api/admin/invites")
+def make_invite(body: InviteBody, admin: dict = Depends(auth.current_admin)) -> dict:
+    return auth.create_invite(admin["id"], note=body.note)
+
+
+@app.get("/api/admin/invites")
+def get_invites(admin: dict = Depends(auth.current_admin)) -> dict:
+    return {"invites": auth.list_invites()}
+
+
+@app.delete("/api/admin/invites/{code}")
+def kill_invite(code: str, admin: dict = Depends(auth.current_admin)) -> dict:
+    return {"ok": auth.revoke_invite(code)}
+
+
+@app.get("/api/admin/users")
+def list_users(admin: dict = Depends(auth.current_admin)) -> dict:
+    rows = query("SELECT id, username, role, created_at, last_login FROM users "
+                 "ORDER BY created_at")
+    return {"users": [dict(r) for r in rows]}
 
 
 @app.get("/api/edges")

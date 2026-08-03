@@ -41,8 +41,7 @@ TAGS = {
     "stats_player": "weekly player box scores (renamed from player_stats)",
     "stats_team": "weekly team aggregates",
     "players": "ID crosswalk — gsis/pfr/espn/sleeper",
-    "rosters": "season rosters",
-    "rosters_weekly": "weekly rosters (use these for team-at-time attribution)",
+    "rosters": "season + weekly rosters (no separate rosters_weekly tag exists)",
     "depth_charts": "depth charts; 2025+ are timestamped, not week-keyed",
     "snap_counts": "snap share",
     "ftn_charting": "FTN manual charting, 2022+ — updates in season",
@@ -316,8 +315,10 @@ def refresh_current(seasons: list[int] | None = None) -> int:
     seasons = seasons or [settings.CURRENT_SEASON]
     total = load_games(seasons=None)          # cheap; full history keeps backtests fresh
     total += load_players()
+    # NOTE: `rosters_weekly` is NOT a release tag (404s) — weekly roster data
+    # lives inside the `rosters` release. Confirmed via `discover`.
     for tag in ("stats_player", "stats_team", "snap_counts", "ftn_charting",
-                "rosters_weekly", "depth_charts", "nextgen_stats", "pfr_advstats"):
+                "rosters", "depth_charts", "nextgen_stats", "pfr_advstats"):
         try:
             sync_tag(tag, seasons=seasons)
         except Exception as exc:  # noqa: BLE001 — one bad source shouldn't kill the run

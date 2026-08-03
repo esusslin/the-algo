@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Algo">
+<title>The Algo</title>
+<link rel="manifest" href="/static/manifest.json">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={darkMode:'class'}</script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<style>
+  body{background:#0b0f14;color:#e6e9ee;-webkit-tap-highlight-color:transparent}
+  .tierA{border-left:3px solid #1d9e75}
+  .tierB{border-left:3px solid #7f77dd}
+  .tierC{border-left:3px solid #5f5e5a}
+  .card{background:#131922;border-radius:12px}
+  .chip{border:.5px solid #2a3340}
+  .chip.on{background:#1d9e75;border-color:#1d9e75;color:#04150f}
+  [x-cloak]{display:none!important}
+  .safe{padding-bottom:calc(64px + env(safe-area-inset-bottom))}
+</style>
+</head>
+<body x-data="algo()" x-init="boot()" x-cloak class="min-h-screen">
+
+<!-- ============ auth ============ -->
+<div x-show="!token" class="max-w-sm mx-auto px-5 pt-16">
+  <h1 class="text-2xl mb-1">The Algo</h1>
+  <p class="text-sm text-slate-400 mb-8" x-text="inviteCode ? 'Create your account' : 'Sign in'"></p>
+
+  <template x-if="inviteCode">
+    <div class="mb-4 text-xs px-3 py-2 rounded"
+         :class="inviteValid ? 'bg-emerald-900/40 text-emerald-300' : 'bg-red-900/40 text-red-300'"
+         x-text="inviteValid ? 'Invite valid' : inviteReason"></div>
+  </template>
+
+  <input x-model="form.username" placeholder="username" autocapitalize="none" autocomplete="username"
+         class="w-full mb-3 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+  <input x-model="form.password" type="password" placeholder="password" autocomplete="current-password"
+         class="w-full mb-4 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+  <button @click="inviteCode ? register() : login()"
+          class="w-full py-3 rounded bg-emerald-600 text-white font-medium"
+          x-text="inviteCode ? 'Create account' : 'Sign in'"></button>
+  <p class="text-red-400 text-sm mt-3" x-text="error"></p>
+</div>
+
+<!-- ============ app ============ -->
+<div x-show="token" class="safe">
+
+  <div class="sticky top-0 z-10 px-4 pt-4 pb-3" style="background:#0b0f14">
+    <div class="flex items-center justify-between">
+      <div>
+        <h1 class="text-lg" x-text="tabTitle()"></h1>
+        <p class="text-xs text-slate-400" x-text="subtitle()"></p>
+      </div>
+      <button @click="refresh()" class="text-xs text-slate-400">
+        <span x-text="fresh"></span> ↻
+      </button>
+    </div>
+
+    <div class="flex gap-2 mt-3 overflow-x-auto no-scrollbar" x-show="tab!=='track'">
+      <template x-for="f in filters" :key="f.key">
+        <button @click="filter=f.key; refresh()"
+                class="chip px-3 py-1.5 rounded-full text-xs whitespace-nowrap"
+                :class="filter===f.key && 'on'" x-text="f.label"></button>
+      </template>
+    </div>
+  </div>
+
+  <!-- ---- picks ---- -->
+  <div x-show="tab==='picks'" class="px-4 space-y-2">
+    <p x-show="!picks.length" class="text-sm text-slate-500 py-12 text-center">
+      No picks clear the edge threshold right now. That's usually the correct answer.
+    </p>
+    <template x-for="p in picks" :key="p.pick_id">
+      <div class="card p-4" :class="'tier'+p.tier">
+        <div class="flex items-start justify-between gap-3">
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-[11px] px-1.5 py-0.5 rounded"
+                    :class="p.tier==='A'?'bg-emerald-900 text-emerald-300':p.tier==='B'?'bg-indigo-900 text-indigo-300':'bg-slate-700 text-slate-300'"
+                    x-text="p.tier"></span>
+              <span class="text-[15px]" x-text="p.description"></span>
+              <span x-show="!p.published" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-900 text-amber-300">dark</span>
+            </div>
+            <p class="text-xs text-slate-500 mb-1" x-text="p.matchup + ' · ' + p.market_label"></p>
+            <p class="text-[13px] text-slate-400 leading-snug" x-text="p.detail"></p>
+          </div>
+        </div>
+        <div class="flex items-center gap-3 mt-3 text-[13px]">
+          <span class="font-medium" x-text="fmtOdds(p.best_price)"></span>
+          <span class="text-slate-400" x-text="p.best_book"></span>
+          <span class="text-emerald-400" x-text="p.edge_pct.toFixed(1)+'%'"></span>
+          <span class="text-slate-500" x-text="p.kelly_units.toFixed(2)+'u'"></span>
+          <button @click="logBet(p)" x-show="!p.i_bet_this"
+                  class="ml-auto text-xs px-3 py-1.5 rounded border border-slate-600">I bet this</button>
+          <span x-show="p.i_bet_this" class="ml-auto text-xs text-emerald-400">logged ✓</span>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ---- track ---- -->
+  <div x-show="tab==='track'" class="px-4">
+    <div class="grid grid-cols-3 gap-2 mb-4">
+      <div class="card p-3"><p class="text-[11px] text-slate-500">Open</p>
+        <p class="text-xl" x-text="live.open||0"></p></div>
+      <div class="card p-3"><p class="text-[11px] text-slate-500">Winning</p>
+        <p class="text-xl text-emerald-400" x-text="live.winning||0"></p></div>
+      <div class="card p-3"><p class="text-[11px] text-slate-500">At risk</p>
+        <p class="text-xl" x-text="(live.units_at_risk||0).toFixed(1)+'u'"></p></div>
+    </div>
+
+    <p class="text-xs text-slate-500 mb-2">Open bets</p>
+    <div class="space-y-2 mb-6">
+      <p x-show="!(live.bets||[]).length" class="text-sm text-slate-500 py-6 text-center">
+        No open bets. Tap "I bet this" on a pick to track it here.
+      </p>
+      <template x-for="b in live.bets||[]" :key="b.bet_id">
+        <div class="card p-3" :class="'tier'+b.tier">
+          <div class="flex items-center justify-between">
+            <span class="text-sm" x-text="b.headline"></span>
+            <span class="text-xs px-2 py-0.5 rounded"
+                  :class="b.status==='winning'?'bg-emerald-900 text-emerald-300':b.status==='losing'?'bg-red-900 text-red-300':'bg-slate-700 text-slate-400'"
+                  x-text="b.status"></span>
+          </div>
+          <p class="text-xs text-slate-500 mt-1">
+            <span x-text="b.away_team+' '+(b.away_score??'-')+' — '+b.home_team+' '+(b.home_score??'-')"></span>
+            <span x-show="b.period" x-text="' · Q'+b.period+' '+(b.clock||'')"></span>
+          </p>
+          <p class="text-xs text-slate-400 mt-1" x-text="b.note"></p>
+        </div>
+      </template>
+    </div>
+
+    <div class="flex gap-2 mb-3">
+      <button @click="scope='mine'; refresh()" class="chip px-3 py-1.5 rounded-full text-xs"
+              :class="scope==='mine' && 'on'">My history</button>
+      <button @click="scope='overall'; refresh()" class="chip px-3 py-1.5 rounded-full text-xs"
+              :class="scope==='overall' && 'on'">All picks</button>
+    </div>
+
+    <div class="card p-4 mb-3">
+      <div class="grid grid-cols-2 gap-y-3 text-sm">
+        <div><p class="text-[11px] text-slate-500">Record</p>
+          <p x-text="(hist.summary?.wins??0)+'-'+(hist.summary?.losses??0)+'-'+(hist.summary?.pushes??0)"></p></div>
+        <div><p class="text-[11px] text-slate-500">Win rate</p>
+          <p x-text="hist.summary?.win_rate!=null ? hist.summary.win_rate+'%' : '—'"></p></div>
+        <div><p class="text-[11px] text-slate-500">ROI</p>
+          <p :class="(hist.summary?.roi_pct||0)>=0?'text-emerald-400':'text-red-400'"
+             x-text="hist.summary?.roi_pct!=null ? hist.summary.roi_pct+'%' : '—'"></p></div>
+        <div><p class="text-[11px] text-slate-500">Avg CLV</p>
+          <p :class="(hist.summary?.avg_clv_pct||0)>=0?'text-emerald-400':'text-red-400'"
+             x-text="hist.summary?.avg_clv_pct!=null ? hist.summary.avg_clv_pct+'%' : '—'"></p></div>
+      </div>
+      <p class="text-[11px] text-slate-500 mt-3 leading-relaxed"
+         x-show="hist.summary?.win_rate_ci">
+        95% confidence on win rate:
+        <span x-text="hist.summary.win_rate_ci[0]+'% – '+hist.summary.win_rate_ci[1]+'%'"></span>.
+        CLV is the number to trust at this sample size.
+      </p>
+    </div>
+
+    <p class="text-xs text-slate-500 mb-2">Settled</p>
+    <div class="space-y-2">
+      <template x-for="r in (hist.rows||[]).filter(r=>r.result!=='pending')" :key="r.bet_id||r.pick_id">
+        <div class="card p-3 flex items-center justify-between">
+          <div class="min-w-0">
+            <p class="text-sm truncate" x-text="r.description"></p>
+            <p class="text-[11px] text-slate-500" x-text="r.market_label+' · '+(r.tier||'')"></p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded shrink-0"
+                :class="r.result==='win'?'bg-emerald-900 text-emerald-300':r.result==='loss'?'bg-red-900 text-red-300':'bg-slate-700 text-slate-400'"
+                x-text="r.result"></span>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ---- admin ---- -->
+  <div x-show="tab==='admin'" class="px-4">
+    <button @click="newInvite()" class="w-full py-3 rounded bg-emerald-600 text-white text-sm mb-4">
+      Create invite
+    </button>
+    <div class="space-y-2">
+      <template x-for="i in invites" :key="i.code">
+        <div class="card p-3">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono" x-text="i.code"></span>
+            <span class="text-[11px] px-2 py-0.5 rounded"
+                  :class="i.status==='open'?'bg-emerald-900 text-emerald-300':'bg-slate-700 text-slate-400'"
+                  x-text="i.status"></span>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1"
+             x-text="i.used_by_username ? 'used by '+i.used_by_username : (i.note||'')"></p>
+          <button x-show="i.status==='open'" @click="copyInvite(i.code)"
+                  class="text-xs mt-2 px-3 py-1.5 rounded border border-slate-600">Copy link</button>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ---- nav ---- -->
+  <nav class="fixed bottom-0 inset-x-0 flex border-t border-slate-800"
+       style="background:#0b0f14; padding-bottom:env(safe-area-inset-bottom)">
+    <button @click="tab='picks'; refresh()" class="flex-1 py-3 text-xs"
+            :class="tab==='picks'?'text-emerald-400':'text-slate-500'">Picks</button>
+    <button @click="tab='track'; refresh()" class="flex-1 py-3 text-xs"
+            :class="tab==='track'?'text-emerald-400':'text-slate-500'">Track</button>
+    <button x-show="user.role==='admin'" @click="tab='admin'; refresh()"
+            class="flex-1 py-3 text-xs"
+            :class="tab==='admin'?'text-emerald-400':'text-slate-500'">Admin</button>
+  </nav>
+</div>
+
+<script>
+function algo(){return{
+  token:localStorage.getItem('algo_token')||'', user:{}, tab:'picks', scope:'mine',
+  filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[],
+  form:{username:'',password:''}, error:'', fresh:'', inviteCode:'', inviteValid:false, inviteReason:'',
+
+  async boot(){
+    const q=new URLSearchParams(location.search); this.inviteCode=q.get('invite')||'';
+    if(this.inviteCode){
+      const r=await(await fetch('/api/auth/invite/'+this.inviteCode)).json();
+      this.inviteValid=r.valid; this.inviteReason=r.reason;
+    }
+    if(this.token) await this.refresh();
+    setInterval(()=>{if(this.token&&this.tab==='track')this.loadLive()},30000);
+  },
+  hdr(){return{'Content-Type':'application/json','Authorization':'Bearer '+this.token}},
+
+  async login(){
+    this.error='';
+    const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(this.form)});
+    if(!r.ok){this.error='Invalid username or password';return}
+    const d=await r.json(); this.token=d.token; this.user=d.user;
+    localStorage.setItem('algo_token',d.token); await this.refresh();
+  },
+  async register(){
+    this.error='';
+    const r=await fetch('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({invite:this.inviteCode,...this.form})});
+    const d=await r.json();
+    if(!r.ok){this.error=d.detail||'Could not create account';return}
+    this.token=d.token; this.user=d.user; localStorage.setItem('algo_token',d.token);
+    history.replaceState({},'','/app'); this.inviteCode=''; await this.refresh();
+  },
+
+  async refresh(){
+    if(!this.token)return;
+    const me=await fetch('/api/auth/me',{headers:this.hdr()});
+    if(me.status===401){this.token='';localStorage.removeItem('algo_token');return}
+    this.user=await me.json();
+    if(!this.filters.length||this.filters.length===1){
+      const f=await(await fetch('/api/history/filters',{headers:this.hdr()})).json();
+      const by=Object.fromEntries(f.options.map(o=>[o.key,o]));
+      this.filters=f.primary.map(k=>by[k]).filter(Boolean);
+    }
+    if(this.tab==='picks'){
+      const d=await(await fetch('/api/picks?filter='+this.filter,{headers:this.hdr()})).json();
+      this.picks=d.picks||[];
+    }
+    if(this.tab==='track'){ await this.loadLive();
+      const d=await(await fetch('/api/history/'+this.scope+'?filter='+this.filter,{headers:this.hdr()})).json();
+      this.hist=d;
+    }
+    if(this.tab==='admin'){
+      const d=await(await fetch('/api/admin/invites',{headers:this.hdr()})).json();
+      this.invites=d.invites||[];
+    }
+    this.fresh=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  },
+  async loadLive(){
+    const d=await(await fetch('/api/live',{headers:this.hdr()})).json(); this.live=d;
+  },
+  async logBet(p){
+    const price=prompt('Price you got (american odds)',p.best_price); if(price===null)return;
+    const stake=prompt('Stake in units',p.kelly_units.toFixed(2)); if(stake===null)return;
+    await fetch('/api/bets',{method:'POST',headers:this.hdr(),
+      body:JSON.stringify({pick_id:p.pick_id,price:parseInt(price),stake:parseFloat(stake),book:p.best_book})});
+    p.i_bet_this=true;
+  },
+  async newInvite(){
+    const note=prompt('Who is this for?')||'';
+    await fetch('/api/admin/invites',{method:'POST',headers:this.hdr(),body:JSON.stringify({note})});
+    await this.refresh();
+  },
+  copyInvite(code){
+    const url=location.origin+'/app?invite='+code;
+    navigator.clipboard.writeText(url); alert('Copied:\n'+url);
+  },
+
+  fmtOdds(p){return p>0?'+'+p:''+p},
+  tabTitle(){return this.tab==='picks'?'Picks':this.tab==='track'?'Track':'Admin'},
+  subtitle(){
+    if(this.tab==='picks'){
+      const a=this.picks.filter(p=>p.tier==='A').length, b=this.picks.filter(p=>p.tier==='B').length;
+      return this.picks.length ? a+' A-tier · '+b+' B-tier' : 'nothing clearing threshold';
+    }
+    if(this.tab==='track')return (this.live.live||0)+' live · '+(this.live.open||0)+' open';
+    return this.invites.length+' invites';
+  },
+}}
+</script>
+</body>
+</html>
