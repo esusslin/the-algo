@@ -213,6 +213,47 @@ def seed_pending(count: int = 14) -> int:
     return made
 
 
+def backfill_users() -> int:
+    """Give demo bets to users who joined AFTER the demo history was seeded.
+
+    Without this, a tester invited later opens Track to an empty "My history"
+    while everyone else has one, and reports it as a bug.
+    """
+    run_migrations()
+    picks = [dict(r) for r in query(
+        "SELECT pick_id, best_price, kelly_units, result FROM picks "
+        "WHERE demo=1 AND result != 'pending'")]
+    if not picks:
+        print("no settled demo picks — run seed first")
+        return 0
+
+    users = [dict(r) for r in query(
+        "SELECT u.id FROM users u WHERE NOT EXISTS "
+        "(SELECT 1 FROM user_bets b WHERE b.user_id=u.id AND b.demo=1)")]
+    if not users:
+        print("every user already has demo bets")
+        return 0
+
+    made = 0
+    with db() as conn:
+        for u in users:
+            for p in random.sample(picks, max(1, len(picks) // 2)):
+                px = p["best_price"] - random.choice([0, 0, 3, 5, 8])
+                stake = round((p["kelly_units"] or 0.5) * random.uniform(0.6, 1.4), 2)
+                insert_row(conn, "user_bets", {
+                    "user_id": u["id"], "pick_id": p["pick_id"],
+                    "book": random.choice(BOOKS), "price": px, "stake": stake,
+                    "placed_at": utcnow(), "result": p["result"],
+                    "payout": payout_for(p["result"], stake, px),
+                    "clv_pct": round(random.gauss(0.4, 1.6), 2),
+                    "closing_price": p["best_price"] - 4,
+                    "graded_at": utcnow(), "demo": 1,
+                })
+                made += 1
+    print(f"backfilled {made} demo bets across {len(users)} users")
+    return made
+
+
 def purge() -> dict:
     run_migrations()
     with db() as conn:

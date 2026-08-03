@@ -401,19 +401,35 @@ def unlog_bet(bet_id: int, user: dict = Depends(auth.current_user)) -> dict:
     return {"ok": cur.rowcount > 0}
 
 
+def _demo_exists() -> bool:
+    return query("SELECT COUNT(*) n FROM picks WHERE demo=1")[0]["n"] > 0
+
+
 @app.get("/api/history/overall")
 def history_overall(filter: str = "all", season: int | None = None,
-                    week: int | None = None,
+                    week: int | None = None, include_demo: bool | None = None,
                     user: dict = Depends(auth.current_user)) -> dict:
+    """Demo rows are opt-in. During the feedback period there is no real settled
+    history, so we default to showing demo when it's the only thing there —
+    otherwise Track looks broken. Once real results exist, demo is off unless
+    explicitly requested."""
     from src.picks.history import overall_history
-    return overall_history(filter, season=season, week=week)
+    if include_demo is None:
+        include_demo = _demo_exists()
+    d = overall_history(filter, season=season, week=week, include_demo=include_demo)
+    d["showing_demo"] = include_demo
+    return d
 
 
 @app.get("/api/history/mine")
-def history_mine(filter: str = "all",
+def history_mine(filter: str = "all", include_demo: bool | None = None,
                  user: dict = Depends(auth.current_user)) -> dict:
     from src.picks.history import user_history
-    return user_history(user["id"], filter)
+    if include_demo is None:
+        include_demo = _demo_exists()
+    d = user_history(user["id"], filter, include_demo=include_demo)
+    d["showing_demo"] = include_demo
+    return d
 
 
 @app.get("/api/history/filters")
@@ -495,7 +511,10 @@ def demo_data(action: str, admin: dict = Depends(auth.current_admin)) -> dict:
     """
     import scripts.seed_demo as demo
     if action == "seed":
-        return {"history": demo.seed(), "pending": demo.seed_pending()}
+        return {"history": demo.seed(), "pending": demo.seed_pending(),
+                "backfilled": demo.backfill_users()}
+    if action == "backfill":
+        return {"backfilled": demo.backfill_users()}
     if action == "purge":
         return demo.purge()
     if action == "status":
@@ -507,35 +526,59 @@ def demo_data(action: str, admin: dict = Depends(auth.current_admin)) -> dict:
     raise HTTPException(400, "action must be seed, purge or status")
 
 
-@app.post("/api/admin/ingest/{step}")
-def run_ingest(step: str, admin: dict = Depends(auth.current_admin)) -> dict:
-    """Trigger a data-loading step on demand (first-run seeding, debugging)."""
+def _ingest_worker(step: str) -> None:
+    """Runs OFF the request path. Downloads a 3MB parquet, parses 25k players and
+    pulls ~5,700 odds rows — far past any HTTP timeout, and it took the whole
+    container down when it ran inline."""
     from src.fetchers import nflverse, odds_api
     from src.market.consensus import build_fair_prices
     from src.picks.generator import generate
-    try:
-        if step == "games":
-            return {"games": nflverse.load_games()}
-        if step == "players":
-            return {"players": nflverse.load_players()}
-        if step == "link":
-            return {"linked": odds_api.link_events()}
-        if step == "poll":
-            return odds_api.poll()
-        if step == "fair":
-            return {"fair_prices": build_fair_prices()}
-        if step == "picks":
-            return generate(source="market_engine")
-        if step == "all":
-            out = {"games": nflverse.load_games(), "players": nflverse.load_players()}
-            out["linked"] = odds_api.link_events()
-            out["poll"] = odds_api.poll()
-            out["fair_prices"] = build_fair_prices()
-            out["picks"] = generate(source="market_engine")["written"]
-            return out
-    except Exception as exc:  # noqa: BLE001 — surface the error to the admin UI
-        raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
-    raise HTTPException(400, "unknown step")
+
+    with job_run(f"ingest_{step}") as ctx:
+        n = 0
+        if step in ("games", "all"):
+            n += nflverse.load_games()
+        if step in ("players", "all"):
+            n += nflverse.load_players()
+        if step in ("link", "all"):
+            n += odds_api.link_events()
+        if step in ("poll", "all"):
+            n += odds_api.poll().get("written", 0)
+        if step in ("fair", "all"):
+            n += build_fair_prices()
+        if step in ("picks", "all"):
+            n += generate(source="market_engine")["written"]
+        ctx["rows_affected"] = n
+
+
+@app.post("/api/admin/ingest/{step}")
+def run_ingest(step: str, admin: dict = Depends(auth.current_admin)) -> dict:
+    """Queue a data-loading step. Returns immediately; watch /health for status."""
+    if step not in {"games", "players", "link", "poll", "fair", "picks", "all"}:
+        raise HTTPException(400, "unknown step")
+    scheduler.add_job(
+        _ingest_worker, "date", args=[step],
+        run_date=datetime.now(timezone.utc),
+        id=f"ingest_{step}_{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=600,
+    )
+    return {"queued": step,
+            "note": "running in the background — check status below in ~1-2 min"}
+
+
+@app.get("/api/admin/ingest-status")
+def ingest_status(admin: dict = Depends(auth.current_admin)) -> dict:
+    rows = query(
+        "SELECT job_name, status, finished_at, duration_s, rows_affected, error "
+        "FROM job_runs WHERE job_name LIKE 'ingest_%' ORDER BY id DESC LIMIT 8"
+    )
+    counts = {}
+    for t in ("games", "players", "odds_current", "fair_prices", "picks"):
+        try:
+            counts[t] = query(f"SELECT COUNT(*) n FROM {t}")[0]["n"]
+        except Exception:  # noqa: BLE001
+            counts[t] = None
+    return {"recent": [dict(r) for r in rows], "counts": counts}
 
 
 @app.get("/api/admin/users")
