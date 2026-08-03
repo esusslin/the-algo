@@ -137,6 +137,82 @@ def seed(weeks: int = 3, per_week: int = 14) -> dict:
     return made
 
 
+def seed_pending(count: int = 14) -> int:
+    """Pending picks so the Picks tab is populated for UI review.
+
+    Uses REAL upcoming games where available, so matchups and kickoff times look
+    right. Falls back to demo fixtures only if the schedule isn't loaded yet.
+    Every row is demo=1 and carries a visible badge in the UI — a tester should
+    never mistake these for live recommendations.
+    """
+    run_migrations()
+    games = [dict(r) for r in query(
+        "SELECT game_id, home_team, away_team FROM games "
+        "WHERE status!='final' ORDER BY kickoff_utc LIMIT 20"
+    )]
+
+    # Self-contained: invent fixtures if the real schedule isn't loaded, so the
+    # UI can be reviewed on a completely empty database.
+    if not games:
+        kickoff = datetime.now(timezone.utc) + timedelta(days=3)
+        with db() as conn:
+            for home, away in TEAMS:
+                gid = f"DEMO_UPCOMING_{away}_{home}"
+                conn.execute(
+                    "INSERT OR REPLACE INTO games (game_id, season, week, season_type, "
+                    "kickoff_utc, home_team, away_team, status, spread_line, total_line, "
+                    "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (gid, 2026, 1, "REG", kickoff.isoformat(timespec="seconds"),
+                     home, away, "scheduled", -3.0, 45.5, utcnow()),
+                )
+                games.append({"game_id": gid, "home_team": home, "away_team": away})
+        print(f"  (no real schedule loaded — invented {len(games)} demo fixtures)")
+
+    # Resolve demo player names against the real crosswalk so prop cards read
+    # "Cooper Kupp over 58.5" rather than "Player over 58.5". Never invents
+    # player rows — a fake gsis_id would corrupt real name resolution later.
+    def pid_for(name: str | None) -> str:
+        if not name:
+            return ""
+        r = query("SELECT player_id FROM players WHERE LOWER(full_name)=? LIMIT 1",
+                  (name.lower(),))
+        return r[0]["player_id"] if r else ""
+
+    made = 0
+    with db() as conn:
+        for i in range(count):
+            g = random.choice(games)
+            mkt, side, line, player = random.choice(MARKETS)
+            # spread the tiers so testers see all three states
+            tier = ["A", "A", "B", "B", "B", "C", "C", "C", "C"][i % 9]
+            edge = {"A": random.uniform(5.0, 7.5), "B": random.uniform(3.0, 4.9),
+                    "C": random.uniform(2.0, 2.9)}[tier]
+            books = {"A": random.randint(16, 22), "B": random.randint(10, 15),
+                     "C": random.randint(8, 11)}[tier]
+            price = _price()
+            insert_row(conn, "picks", {
+                "game_id": g["game_id"], "market_type": mkt,
+                "player_id": pid_for(player),
+                "side": side, "line": line, "source": "market_engine",
+                "best_book": random.choice(BOOKS), "best_price": price,
+                "fair_prob": 0.54, "blended_prob": 0.54,
+                "edge_pct": round(edge, 2),
+                "kelly_units": round(min(edge / 4, 1.5), 2), "tier": tier,
+                "ai_verdict": "OK",
+                "headline": (f"{player} {side} {line:g}" if player
+                             else f"{side.title()} {line:g}" if line else side.title()),
+                "detail": (f"DEMO — {books} books quoting, sharp book "
+                           f"{'agrees' if tier == 'A' else 'unavailable'}. "
+                           f"Placeholder for UI review, not a real recommendation."),
+                "published": 1, "visibility": "all",
+                "created_at": utcnow(), "published_at": utcnow(),
+                "result": "pending", "demo": 1,
+            })
+            made += 1
+    print(f"seeded {made} pending demo picks across A/B/C tiers")
+    return made
+
+
 def purge() -> dict:
     run_migrations()
     with db() as conn:
@@ -164,6 +240,11 @@ def status() -> None:
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "seed":
+        seed()             # settled history for Track
+        seed_pending()     # pending picks for the Picks tab
+    elif cmd == "pending":
+        seed_pending()
+    elif cmd == "history":
         seed()
     elif cmd == "purge":
         purge()

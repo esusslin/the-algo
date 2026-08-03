@@ -336,7 +336,8 @@ def picks(filter: str = "all", user: dict = Depends(auth.current_user)) -> dict:
 
     mine = {r["pick_id"] for r in query(
         "SELECT pick_id FROM user_bets WHERE user_id=?", (user["id"],))}
-    games = {r["game_id"]: r for r in query(
+    # dict(), not the raw Row — sqlite3.Row has no .get()
+    games = {r["game_id"]: dict(r) for r in query(
         "SELECT game_id, home_team, away_team, kickoff_utc FROM games")}
     names = {r["player_id"]: r["full_name"] for r in query(
         "SELECT player_id, full_name FROM players WHERE full_name IS NOT NULL")}
