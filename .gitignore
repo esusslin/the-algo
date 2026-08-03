@@ -1,9 +1,15 @@
 # ---- secrets: never commit ----
+# `.env*` (no dot) is deliberate: it also catches Finder duplicates like
+# ".env copy" and ".env backup", which `.env.*` would miss — and those contain
+# real keys.
 .env
-.env.*
+.env*
 !.env.example
 *.pem
 *.key
+*secret*
+*credentials*
+!*.example
 
 # ---- data & artifacts: live on the Railway volume, not in git ----
 /data/

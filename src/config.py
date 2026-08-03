@@ -85,6 +85,13 @@ class Settings:
     KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.125)
     MAX_BET_PCT_BANKROLL: float = _float("MAX_BET_PCT_BANKROLL", 2.0)
     SHARP_BOOKS: list[str] = _list("SHARP_BOOKS", "pinnacle")
+    # Books you can actually place a bet at. An edge at an offshore book you
+    # have no account with is not an edge. Adjust to your real accounts.
+    BETTABLE_BOOKS: list[str] = _list(
+        "BETTABLE_BOOKS",
+        "draftkings,fanduel,betmgm,caesars,williamhill_us,betrivers,"
+        "pointsbetus,espnbet,fanatics,betonlineag,lowvig,bovada,mybookieag",
+    )
     DEVIG_METHOD: str = os.getenv("DEVIG_METHOD", "power")
 
     # ---- season ----

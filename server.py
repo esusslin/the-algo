@@ -47,6 +47,24 @@ def _refresh_injuries() -> None:
         ctx["rows_affected"] = injuries.refresh()
 
 
+def _poll_odds() -> None:
+    """Poll odds, then immediately reprice. Fair values are only useful fresh."""
+    from src.fetchers import odds_api
+    from src.market.consensus import build_fair_prices
+    with job_run("poll_odds") as ctx:
+        result = odds_api.poll()
+        ctx["rows_affected"] = result.get("changed", 0)
+    if result.get("written"):
+        with job_run("build_fair_prices") as ctx:
+            ctx["rows_affected"] = build_fair_prices()
+
+
+def _link_odds_events() -> None:
+    from src.fetchers import odds_api
+    with job_run("link_odds_events") as ctx:
+        ctx["rows_affected"] = odds_api.link_events()
+
+
 def _health_heartbeat() -> None:
     with job_run("heartbeat") as ctx:
         ctx["rows_affected"] = 1
@@ -58,12 +76,17 @@ JOBS: list[tuple] = [
     (_refresh_nflverse, "cron", dict(day_of_week="tue", hour=7, minute=0), "refresh_nflverse_tue"),
     (_refresh_nflverse, "cron", dict(day_of_week="thu", hour=7, minute=0), "refresh_nflverse_thu"),
     (_refresh_injuries, "cron", dict(day_of_week="wed,thu,fri", hour=17, minute=0), "refresh_injuries"),
+    # poll_odds runs often but self-throttles per tier and time-to-kickoff
+    # (see odds_api.TIERS) — the 5-minute interval is an upper bound, not a rate.
+    (_poll_odds, "interval", dict(minutes=5), "poll_odds"),
+    (_link_odds_events, "cron", dict(day_of_week="tue", hour=8, minute=0), "link_odds_events"),
     (_health_heartbeat, "interval", dict(minutes=30), "heartbeat"),
 ]
 
 # Max staleness per *job_run name* (the name passed to job_run(), not the APScheduler id).
 EXPECTED_FRESHNESS = {
     "heartbeat": timedelta(hours=2),
+    "poll_odds": timedelta(hours=3),
     "refresh_injuries": timedelta(days=8),
     "refresh_nflverse": timedelta(days=9),
 }
