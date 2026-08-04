@@ -81,21 +81,61 @@ class TrainResult:
         return "\n".join(lines)
 
 
+_BACKEND: str | None = None
+
+
 def _fit_gbm(Xtr, ytr, Xte, seed: int = 0):
-    """LightGBM if available, ridge otherwise. Conservative settings: the signal
-    is faint and an over-parameterised tree will memorise noise."""
+    """Gradient boosting with graceful fallbacks.
+
+    Conservative settings throughout: the signal in residuals is faint, and an
+    over-parameterised tree will happily memorise noise and report it as skill.
+
+    Backend order:
+      1. LightGBM — fastest, but on macOS it needs OpenMP (`brew install libomp`)
+         and raises OSError at import without it.
+      2. sklearn HistGradientBoosting — near-equivalent algorithm, no external
+         native dependency. The practical default on a Mac.
+      3. Ridge — last resort, so a fresh clone can still run end to end.
+    """
+    global _BACKEND
+    Xtr, Xte = np.nan_to_num(Xtr), np.nan_to_num(Xte)
+
     try:
         import lightgbm as lgb
         m = lgb.LGBMRegressor(
             n_estimators=300, learning_rate=0.02, num_leaves=7,
             min_child_samples=80, subsample=0.8, subsample_freq=1,
             colsample_bytree=0.7, reg_lambda=5.0, random_state=seed, verbose=-1)
-        m.fit(np.nan_to_num(Xtr), ytr)
-        return m, m.predict(np.nan_to_num(Xte))
+        m.fit(Xtr, ytr)
+        if _BACKEND != "lightgbm":
+            _BACKEND = "lightgbm"
+            log.info("gradient boosting backend: lightgbm")
+        return m, m.predict(Xte)
+    except (ImportError, OSError) as exc:
+        if _BACKEND is None:
+            log.warning("lightgbm unavailable (%s) — falling back to sklearn. "
+                        "On macOS: brew install libomp", type(exc).__name__)
+
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        m = HistGradientBoostingRegressor(
+            max_iter=300, learning_rate=0.02, max_leaf_nodes=7,
+            min_samples_leaf=80, l2_regularization=5.0,
+            early_stopping=False, random_state=seed)
+        m.fit(Xtr, ytr)
+        if _BACKEND != "sklearn":
+            _BACKEND = "sklearn"
+            log.info("gradient boosting backend: sklearn HistGradientBoosting")
+        return m, m.predict(Xte)
     except ImportError:
-        from sklearn.linear_model import Ridge
-        m = Ridge(alpha=20.0).fit(np.nan_to_num(Xtr), ytr)
-        return m, m.predict(np.nan_to_num(Xte))
+        pass
+
+    from sklearn.linear_model import Ridge
+    m = Ridge(alpha=20.0).fit(Xtr, ytr)
+    if _BACKEND != "ridge":
+        _BACKEND = "ridge"
+        log.warning("no gradient boosting available — using ridge")
+    return m, m.predict(Xte)
 
 
 def train_residual(target: str = "spread", min_train_seasons: int = 5,
@@ -148,11 +188,14 @@ def train_residual(target: str = "spread", min_train_seasons: int = 5,
             "resid_rmse": float(np.sqrt(np.mean((resid_hat - y_resid[te]) ** 2))),
         })
         oof_p.append(p); oof_y.append(y_binary[te])
+        imp = None
         if hasattr(model, "feature_importances_"):
             imp = np.asarray(model.feature_importances_, dtype=float)
-            if imp.sum() > 0:
-                importances += imp / imp.sum()
-                n_fits += 1
+        elif hasattr(model, "coef_"):
+            imp = np.abs(np.asarray(model.coef_, dtype=float)).ravel()
+        if imp is not None and imp.sum() > 0 and len(imp) == X.shape[1]:
+            importances += imp / imp.sum()
+            n_fits += 1
 
     p_all = np.concatenate(oof_p) if oof_p else np.array([])
     y_all = np.concatenate(oof_y) if oof_y else np.array([])
