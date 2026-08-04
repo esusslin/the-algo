@@ -154,9 +154,11 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
             model=settings.MODEL_REASON, max_tokens=300, temperature=0.0,
             ref_type="pick", ref_id=str(pick.get("pick_id", "")))
     except AIUnavailable as exc:
-        # FAIL OPEN. A broken AI layer must not suppress the slate.
+        # FAIL OPEN. A broken AI layer must not suppress the slate — but the
+        # reason must reach the operator, not just a log line nobody reads.
         log.warning("redteam unavailable: %s", exc)
-        return {"verdict": "OK", "reason": "", "evidence": "", "source": "unavailable"}
+        return {"verdict": "OK", "reason": "", "evidence": "",
+                "source": "unavailable", "error": str(exc)[:200]}
 
     verdict = str(out.get("verdict", "OK")).upper().strip()
     reason = str(out.get("reason", ""))[:300]
@@ -194,11 +196,13 @@ def review_slate(picks: list[dict]) -> dict:
         sources[r.get("source", "?")] = sources.get(r.get("source", "?"), 0) + 1
 
     reviewed_by_model = sources.get("model", 0)
+    errors = sorted({r["error"] for r in results.values() if r.get("error")})
     return {"reviewed": len(picks), "games": len(contexts),
             "counts": counts, "results": results,
             "sources": sources,
             "reviewed_by_model": reviewed_by_model,
-            "ai_ran": reviewed_by_model > 0}
+            "ai_ran": reviewed_by_model > 0,
+            "errors": errors}
 
 
 def apply_to_picks(limit: int = 60) -> dict:
@@ -242,7 +246,7 @@ def apply_to_picks(limit: int = 60) -> dict:
     return {"reviewed": out["reviewed"], "games": out["games"],
             "counts": out["counts"], "changed": changed,
             "ai_ran": out["ai_ran"], "reviewed_by_model": out["reviewed_by_model"],
-            "sources": out["sources"]}
+            "sources": out["sources"], "errors": out.get("errors", [])}
 
 
 if __name__ == "__main__":

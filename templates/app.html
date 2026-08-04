@@ -725,8 +725,8 @@ function algo(){return{
       const c=d.counts||{};
       if(!d.reviewed){ this.rtMsg='No pending picks to review.'; }
       else if(!d.ai_ran){
-        this.rtMsg = `${d.reviewed} picks skipped — AI did not run `
-          +`(${Object.keys(d.sources||{}).join(', ')}). Verdicts defaulted to OK.`;
+        this.rtMsg = `${d.reviewed} picks skipped — AI did not run. `
+          +((d.errors||[]).join(' | ') || 'no reason reported');
       } else {
         this.rtMsg = `${d.reviewed_by_model} of ${d.reviewed} picks reviewed by the `
           +`model across ${d.games} games — ${c.OK||0} ok, ${c.FLAG||0} flagged, `
