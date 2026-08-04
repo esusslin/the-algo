@@ -107,9 +107,41 @@
         <h1 class="text-lg" x-text="tabTitle()"></h1>
         <p class="text-xs text-slate-400" x-text="subtitle()"></p>
       </div>
-      <button @click="refresh()" class="text-xs text-slate-400">
-        <span x-text="fresh"></span> ↻
-      </button>
+      <div class="flex items-center gap-3">
+        <button @click="refresh()" class="text-xs text-slate-400">
+          <span x-text="fresh"></span> ↻
+        </button>
+        <button @click="account=!account"
+                class="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 text-xs relative"
+                :aria-label="'Account: '+user.username">
+          <span x-text="(user.username||'?').slice(0,1).toUpperCase()"></span>
+          <span x-show="!user.can_self_reset"
+                class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400"></span>
+        </button>
+      </div>
+    </div>
+
+    <div x-show="account" class="card p-4 mt-3">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <p class="text-sm" x-text="user.username"></p>
+          <p class="text-[11px] text-slate-500" x-text="user.role"></p>
+        </div>
+        <button @click="signOut()" class="text-xs px-3 py-1.5 rounded border border-slate-600">
+          Sign out
+        </button>
+      </div>
+      <p class="text-xs mb-2"
+         :class="user.can_self_reset ? 'text-slate-500' : 'text-amber-400'"
+         x-text="user.can_self_reset
+           ? 'Mobile on file — you can reset your own password.'
+           : 'No mobile on file. Add one so you can reset your own password.'"></p>
+      <div class="flex gap-2">
+        <input x-model="profilePhone" type="tel" placeholder="mobile number"
+               class="flex-1 px-3 py-2 rounded bg-slate-800/60 border border-slate-700 text-sm">
+        <button @click="saveProfile()" class="px-4 py-2 rounded border border-slate-600 text-xs">Save</button>
+      </div>
+      <p class="text-xs text-slate-400 mt-2" x-text="profileMsg"></p>
     </div>
 
     <div class="flex gap-2 mt-3 overflow-x-auto no-scrollbar"
@@ -288,21 +320,6 @@
         <span x-text="hist.summary.win_rate_ci[0]+'% – '+hist.summary.win_rate_ci[1]+'%'"></span>.
         CLV is the number to trust at this sample size.
       </p>
-    </div>
-
-    <div class="card p-4 mb-4">
-      <p class="text-sm mb-1">Account</p>
-      <p class="text-xs mb-3"
-         :class="user.can_self_reset ? 'text-slate-500' : 'text-amber-400'"
-         x-text="user.can_self_reset
-           ? 'Mobile on file — you can reset your own password.'
-           : 'No mobile on file. Add one so you can reset your own password.'"></p>
-      <div class="flex gap-2">
-        <input x-model="profilePhone" type="tel" placeholder="mobile number"
-               class="flex-1 px-3 py-2 rounded bg-slate-800/60 border border-slate-700 text-sm">
-        <button @click="saveProfile()" class="px-4 py-2 rounded border border-slate-600 text-xs">Save</button>
-      </div>
-      <p class="text-xs text-slate-400 mt-2" x-text="profileMsg"></p>
     </div>
 
     <p class="text-xs text-slate-500 mb-2">Settled</p>
@@ -519,7 +536,7 @@ function algo(){return{
   inviteCode:'', inviteValid:false, inviteReason:'',
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
-  betting:null, betForm:{book:'',price:0,stake:0},
+  betting:null, betForm:{book:'',price:0,stake:0}, account:false,
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -561,6 +578,12 @@ function algo(){return{
     history.replaceState({},'','/app'); this.inviteCode=''; await this.refresh();
   },
 
+  signOut(){
+    this.token=''; this.user={}; this.account=false;
+    localStorage.removeItem('algo_token');
+    this.picks=[]; this.hist={}; this.live={};
+    this.form={username:'',password:'',phone:''};
+  },
   async saveProfile(){
     this.profileMsg='Saving…';
     const r=await fetch('/api/auth/me',{method:'PATCH',headers:this.hdr(),
