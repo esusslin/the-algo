@@ -355,6 +355,33 @@
         <button @click="ingest('poll')" class="py-2 rounded border border-slate-600 text-xs">Refresh odds</button>
       </div>
       <p class="text-xs text-slate-400 mt-3" x-text="busy||ingestMsg"></p>
+
+      <div class="grid grid-cols-2 gap-y-1 text-xs mt-3 pt-3 border-t border-slate-800">
+        <template x-for="(v,k) in (status.counts||{})" :key="k">
+          <template x-if="true">
+            <div class="contents">
+              <span class="text-slate-500" x-text="k.replace('_',' ')"></span>
+              <span :class="v ? 'text-slate-200' : 'text-slate-600'"
+                    x-text="v===null?'—':v.toLocaleString()"></span>
+            </div>
+          </template>
+        </template>
+      </div>
+
+      <div class="mt-3 pt-3 border-t border-slate-800 space-y-1">
+        <template x-for="j in (status.recent||[]).slice(0,4)" :key="j.finished_at+j.job_name">
+          <div class="flex items-center justify-between text-xs">
+            <span class="text-slate-500" x-text="j.job_name.replace('ingest_','')"></span>
+            <span class="flex items-center gap-2">
+              <span class="text-slate-600" x-text="j.duration_s ? j.duration_s+'s' : ''"></span>
+              <span :class="j.status==='success'?'text-emerald-400':'text-red-400'"
+                    x-text="j.status"></span>
+            </span>
+          </div>
+        </template>
+        <p x-show="(status.recent||[]).length && status.recent[0].error"
+           class="text-xs text-red-400 mt-1" x-text="status.recent[0].error"></p>
+      </div>
     </div>
 
     <div class="card p-4 mb-4">
@@ -416,7 +443,7 @@ function algo(){return{
   form:{username:'',password:'',phone:''}, error:'', fresh:'',
   inviteCode:'', inviteValid:false, inviteReason:'',
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
-  busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'',
+  busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -506,6 +533,7 @@ function algo(){return{
     if(this.tab==='admin'){
       const d=await(await fetch('/api/admin/invites',{headers:this.hdr()})).json();
       this.invites=d.invites||[];
+      await this.loadStatus();
     }
     this.fresh=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   },
@@ -519,14 +547,33 @@ function algo(){return{
       body:JSON.stringify({pick_id:p.pick_id,price:parseInt(price),stake:parseFloat(stake),book:p.best_book})});
     p.i_bet_this=true;
   },
+  async loadStatus(){
+    this.status=await(await fetch('/api/admin/ingest-status',{headers:this.hdr()})).json();
+  },
   async ingest(step){
-    this.busy='Working… this can take a minute.'; this.ingestMsg='';
+    this.ingestMsg=''; this.busy='Queued — running in the background…';
     try{
       const r=await fetch('/api/admin/ingest/'+step,{method:'POST',headers:this.hdr()});
-      const d=await r.json();
-      this.ingestMsg = r.ok ? JSON.stringify(d) : ('Failed: '+(d.detail||r.status));
-    }catch(e){ this.ingestMsg='Failed: '+e.message }
-    this.busy=''; await this.refresh();
+      if(!r.ok){ this.busy=''; this.ingestMsg='Failed: '+((await r.json()).detail||r.status); return }
+    }catch(e){ this.busy=''; this.ingestMsg='Failed: '+e.message; return }
+
+    // poll until the job lands, so you get a real "done" rather than guessing
+    clearInterval(this.poller);
+    const started=Date.now(), before=JSON.stringify((this.status.recent||[])[0]||{});
+    this.poller=setInterval(async()=>{
+      await this.loadStatus();
+      const top=(this.status.recent||[])[0];
+      const done = top && JSON.stringify(top)!==before && top.job_name.includes(step);
+      if(done){
+        clearInterval(this.poller); this.busy='';
+        this.ingestMsg = top.status==='success'
+          ? `Done in ${top.duration_s}s — ${top.rows_affected.toLocaleString()} rows.`
+          : `Failed: ${top.error||'unknown'}`;
+      } else if(Date.now()-started>300000){
+        clearInterval(this.poller); this.busy='';
+        this.ingestMsg='Still running after 5 min — check back shortly.';
+      }
+    },3000);
   },
   async demo(action){
     this.demoMsg='Working…';
