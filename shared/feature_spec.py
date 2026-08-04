@@ -61,8 +61,28 @@ FEATURES: list[Feature] = [
     Feature("temp_c", "float", 15.0, "pregame", "forecast temperature", group="weather"),
     Feature("precip_mm", "float", 0.0, "pregame", "forecast precipitation", group="weather"),
 
-    # ---- team strength (populated Aug 22-28) ----
-    # Feature("home_off_epa_adj", ...), Feature("away_def_epa_adj", ...), ...
+    # ---- team strength: opponent-adjusted unit ratings (research/ratings.py) ----
+    # Sign convention: offense HIGHER is better, defense LOWER is better.
+    Feature("home_off_rating", "float", 0.0, "pregame", "opp-adj offensive EPA/play", group="strength"),
+    Feature("home_def_rating", "float", 0.0, "pregame", "opp-adj defensive EPA allowed", group="strength"),
+    Feature("away_off_rating", "float", 0.0, "pregame", "opp-adj offensive EPA/play", group="strength"),
+    Feature("away_def_rating", "float", 0.0, "pregame", "opp-adj defensive EPA allowed", group="strength"),
+    Feature("home_off_pass", "float", 0.0, "pregame", "opp-adj pass offense", group="strength"),
+    Feature("home_def_pass", "float", 0.0, "pregame", "opp-adj pass defense", group="strength"),
+    Feature("away_off_pass", "float", 0.0, "pregame", "opp-adj pass offense", group="strength"),
+    Feature("away_def_pass", "float", 0.0, "pregame", "opp-adj pass defense", group="strength"),
+    Feature("home_off_rush", "float", 0.0, "pregame", "opp-adj rush offense", group="strength"),
+    Feature("home_def_rush", "float", 0.0, "pregame", "opp-adj rush defense", group="strength"),
+    Feature("away_off_rush", "float", 0.0, "pregame", "opp-adj rush offense", group="strength"),
+    Feature("away_def_rush", "float", 0.0, "pregame", "opp-adj rush defense", group="strength"),
+
+    # ---- matchup: unit vs unit, the actual mismatch signal ----
+    Feature("home_pass_edge", "float", 0.0, "pregame", "home pass off minus away pass def", group="matchup"),
+    Feature("away_pass_edge", "float", 0.0, "pregame", "away pass off minus home pass def", group="matchup"),
+    Feature("home_rush_edge", "float", 0.0, "pregame", "home rush off minus away rush def", group="matchup"),
+    Feature("away_rush_edge", "float", 0.0, "pregame", "away rush off minus home rush def", group="matchup"),
+    Feature("net_edge", "float", 0.0, "pregame", "overall home minus away advantage", group="matchup"),
+    Feature("ratings_confident", "bool", False, "pregame", "both teams past the small-sample threshold", group="matchup"),
 
     # ---- availability (populated once the injury feed is proven) ----
     # Feature("home_qb_is_starter", ...), Feature("home_missing_value", ...), ...
