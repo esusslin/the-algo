@@ -593,9 +593,12 @@ def history_filters(user: dict = Depends(auth.current_user)) -> dict:
 
 @app.get("/api/live")
 def live(user: dict = Depends(auth.current_user)) -> dict:
-    """In-progress state for this user's open bets."""
-    from src.picks.live import open_bet_status
-    return open_bet_status(user["id"])
+    """In-progress state for this user's open bets, plus what settled today."""
+    from src.picks.live import open_bet_status, settled_today
+    d = open_bet_status(user["id"])
+    d["settled_today"] = settled_today(user["id"])
+    d["net_today"] = round(sum(b["payout"] or 0 for b in d["settled_today"]), 3)
+    return d
 
 
 # ==========================================================================
@@ -663,7 +666,9 @@ def demo_data(action: str, admin: dict = Depends(auth.current_admin)) -> dict:
     import scripts.seed_demo as demo
     if action == "seed":
         return {"history": demo.seed(), "pending": demo.seed_pending(),
-                "backfilled": demo.backfill_users()}
+                "live": demo.seed_live(), "backfilled": demo.backfill_users()}
+    if action == "live":
+        return {"live": demo.seed_live()}
     if action == "backfill":
         return {"backfilled": demo.backfill_users()}
     if action == "purge":

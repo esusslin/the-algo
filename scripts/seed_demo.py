@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.db import db, insert_row, query, run_migrations, utcnow  # noqa: E402
+from src.db import db, insert_row, query, run_migrations, upsert_rows, utcnow  # noqa: E402
 from src.picks.grading import payout_for  # noqa: E402
 
 random.seed(20260908)
@@ -213,6 +213,85 @@ def seed_pending(count: int = 14) -> int:
     return made
 
 
+def seed_live(per_user: int = 6) -> int:
+    """Populate the My bets tab: open bets on games that look in-progress.
+
+    Writes `live_state` rows so some games read as live with a score and clock,
+    some as not started, some as just finished. Without this the tab is empty
+    for testers and there's nothing to give feedback on.
+    """
+    run_migrations()
+    picks = [dict(r) for r in query(
+        "SELECT p.pick_id, p.game_id, p.best_price, p.kelly_units, p.best_book "
+        "FROM picks p WHERE p.demo=1 AND p.result='pending' LIMIT 40")]
+    users = [dict(r) for r in query("SELECT id FROM users")]
+    if not picks or not users:
+        print("seed pending picks and create an account first")
+        return 0
+
+    chosen = random.sample(picks, min(per_user, len(picks)))
+    game_ids = list({p["game_id"] for p in chosen})
+
+    # A believable Sunday: most games running, one about to start, one just done.
+    states = []
+    for i, gid in enumerate(game_ids):
+        if i == 0:
+            states.append((gid, None, None, None, None, "pre"))
+        elif i == len(game_ids) - 1 and len(game_ids) > 2:
+            states.append((gid, random.randint(17, 31), random.randint(10, 27),
+                           4, "0:00", "post"))
+        else:
+            states.append((gid, random.randint(7, 28), random.randint(3, 24),
+                           random.randint(2, 4),
+                           f"{random.randint(1,14)}:{random.randint(0,59):02d}", "in"))
+
+    made = 0
+    with db() as conn:
+        upsert_rows(conn, "live_state", [{
+            "game_id": g, "home_score": hs, "away_score": aws, "period": per,
+            "clock": clk, "status": st, "possession": None,
+            "home_win_prob": None, "updated_at": utcnow(),
+        } for g, hs, aws, per, clk, st in states], key_cols=["game_id"])
+
+        # Prop bets need a live stat line or they read "stat unavailable" —
+        # which is real behaviour in production but useless for UI review.
+        # Match on player_id as stored, including '' — the status lookup uses
+        # the same value, so an unresolved player still gets a stat line.
+        props = [dict(r) for r in query(
+            "SELECT DISTINCT p.game_id, p.player_id, p.market_type, p.line "
+            "FROM picks p WHERE p.demo=1 AND p.result='pending' "
+            "AND p.market_type LIKE 'player_%'")]
+        if props:
+            upsert_rows(conn, "live_player_stats", [{
+                "game_id": pr["game_id"], "player_id": pr["player_id"],
+                "player_name": "", "stat_key": pr["market_type"],
+                # straddle the line so testers see both winning and losing props
+                "value": round((pr["line"] or 50) * random.uniform(0.7, 1.35), 1),
+                "updated_at": utcnow(),
+            } for pr in props], key_cols=["game_id", "player_id", "stat_key"])
+
+        for u in users:
+            for p in chosen:
+                dup = conn.execute(
+                    "SELECT 1 FROM user_bets WHERE user_id=? AND pick_id=?",
+                    (u["id"], p["pick_id"])).fetchone()
+                if dup:
+                    continue
+                px = p["best_price"] - random.choice([0, 0, 3, 5])
+                insert_row(conn, "user_bets", {
+                    "user_id": u["id"], "pick_id": p["pick_id"],
+                    "book": p["best_book"], "price": px,
+                    "stake": round((p["kelly_units"] or 0.5) * random.uniform(.7, 1.3), 2),
+                    "placed_at": utcnow(), "result": "pending", "demo": 1,
+                })
+                made += 1
+
+    live_n = sum(1 for s in states if s[5] == "in")
+    print(f"seeded {made} open bets across {len(users)} users; "
+          f"{live_n} of {len(game_ids)} games showing live")
+    return made
+
+
 def backfill_users() -> int:
     """Give demo bets to users who joined AFTER the demo history was seeded.
 
@@ -257,11 +336,19 @@ def backfill_users() -> int:
 def purge() -> dict:
     run_migrations()
     with db() as conn:
+        # live_state rows are keyed to demo picks' games — clear them too, or a
+        # real game keeps showing a fake score after the demo is gone.
+        live = conn.execute(
+            "DELETE FROM live_state WHERE game_id IN "
+            "(SELECT DISTINCT game_id FROM picks WHERE demo=1)").rowcount
+        conn.execute(
+            "DELETE FROM live_player_stats WHERE game_id IN "
+            "(SELECT DISTINCT game_id FROM picks WHERE demo=1)")
         b = conn.execute("DELETE FROM user_bets WHERE demo=1").rowcount
         p = conn.execute("DELETE FROM picks WHERE demo=1").rowcount
         g = conn.execute("DELETE FROM games WHERE game_id LIKE 'DEMO_%'").rowcount
-    print(f"purged {g} games, {p} picks, {b} user bets")
-    return {"games": g, "picks": p, "bets": b}
+    print(f"purged {g} games, {p} picks, {b} user bets, {live} live states")
+    return {"games": g, "picks": p, "bets": b, "live_states": live}
 
 
 def status() -> None:
@@ -283,8 +370,11 @@ if __name__ == "__main__":
     if cmd == "seed":
         seed()             # settled history for Track
         seed_pending()     # pending picks for the Picks tab
+        seed_live()        # open bets + live scores for My bets
     elif cmd == "pending":
         seed_pending()
+    elif cmd == "live":
+        seed_live()
     elif cmd == "history":
         seed()
     elif cmd == "purge":

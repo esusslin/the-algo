@@ -155,13 +155,42 @@ def open_bet_status(user_id: int) -> dict:
         at_risk += r["stake"] or 0
         out.append(d)
 
+    # Group by what the user actually cares about right now: what's happening,
+    # what's about to happen, what already resolved today.
+    groups: dict[str, list] = {"live": [], "upcoming": [], "final": []}
+    for b in out:
+        state = b.get("game_state")
+        groups["live" if state == "in" else
+               "final" if state == "post" else "upcoming"].append(b)
+
     return {
         "open": len(out),
         "live": live_count,
         "winning": winning,
+        "losing": sum(1 for b in out if b.get("status") == "losing"),
         "units_at_risk": round(at_risk, 3),
+        "units_winning": round(
+            sum(b["stake"] or 0 for b in out if b.get("status") == "winning"), 3),
+        "groups": groups,
         "bets": out,
     }
+
+
+def settled_today(user_id: int) -> list[dict]:
+    """Bets graded in the last 24h — so a Sunday evening check shows the whole
+    day, not just what's still open."""
+    rows = query(
+        "SELECT b.id AS bet_id, b.stake, b.price, b.book, b.result, b.payout, "
+        "       b.clv_pct, p.tier, p.headline, p.market_type, "
+        "       g.home_team, g.away_team, g.home_score, g.away_score "
+        "FROM user_bets b JOIN picks p ON p.pick_id=b.pick_id "
+        "JOIN games g ON g.game_id=p.game_id "
+        "WHERE b.user_id=? AND b.result!='pending' "
+        "AND b.graded_at >= datetime('now','-24 hours') "
+        "ORDER BY b.graded_at DESC",
+        (user_id,),
+    )
+    return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":
