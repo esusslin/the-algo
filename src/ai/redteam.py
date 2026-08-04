@@ -179,6 +179,10 @@ def review_slate(picks: list[dict]) -> dict:
     contexts: dict[str, dict] = {}
     results: dict[int, dict] = {}
     counts = {"OK": 0, "FLAG": 0, "KILL": 0}
+    # "all OK" is ambiguous: it looks the same whether the model reviewed every
+    # pick and found nothing, or never ran at all (the agent fails open by
+    # design). Track the source so the caller can tell the difference.
+    sources: dict[str, int] = {}
 
     for p in picks:
         gid = p["game_id"]
@@ -187,9 +191,14 @@ def review_slate(picks: list[dict]) -> dict:
         r = review_pick(p, contexts[gid])
         results[p["pick_id"]] = r
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        sources[r.get("source", "?")] = sources.get(r.get("source", "?"), 0) + 1
 
+    reviewed_by_model = sources.get("model", 0)
     return {"reviewed": len(picks), "games": len(contexts),
-            "counts": counts, "results": results}
+            "counts": counts, "results": results,
+            "sources": sources,
+            "reviewed_by_model": reviewed_by_model,
+            "ai_ran": reviewed_by_model > 0}
 
 
 def apply_to_picks(limit: int = 60) -> dict:
@@ -228,10 +237,12 @@ def apply_to_picks(limit: int = 60) -> dict:
             if r["verdict"] != "OK":
                 changed += 1
 
-    log.info("redteam: %s across %d games, %d picks downgraded",
-             out["counts"], out["games"], changed)
+    log.info("redteam: %s across %d games, %d downgraded (ai_ran=%s, sources=%s)",
+             out["counts"], out["games"], changed, out["ai_ran"], out["sources"])
     return {"reviewed": out["reviewed"], "games": out["games"],
-            "counts": out["counts"], "changed": changed}
+            "counts": out["counts"], "changed": changed,
+            "ai_ran": out["ai_ran"], "reviewed_by_model": out["reviewed_by_model"],
+            "sources": out["sources"]}
 
 
 if __name__ == "__main__":

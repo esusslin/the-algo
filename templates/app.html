@@ -723,10 +723,15 @@ function algo(){return{
       const d=await r.json();
       if(!r.ok){ this.rtMsg='Failed: '+(d.detail||r.status); return }
       const c=d.counts||{};
-      this.rtMsg = d.reviewed
-        ? `${d.reviewed} picks across ${d.games} games — ${c.OK||0} ok, `
-          +`${c.FLAG||0} flagged, ${c.KILL||0} killed (${d.changed} downgraded)`
-        : 'No pending picks to review.';
+      if(!d.reviewed){ this.rtMsg='No pending picks to review.'; }
+      else if(!d.ai_ran){
+        this.rtMsg = `${d.reviewed} picks skipped — AI did not run `
+          +`(${Object.keys(d.sources||{}).join(', ')}). Verdicts defaulted to OK.`;
+      } else {
+        this.rtMsg = `${d.reviewed_by_model} of ${d.reviewed} picks reviewed by the `
+          +`model across ${d.games} games — ${c.OK||0} ok, ${c.FLAG||0} flagged, `
+          +`${c.KILL||0} killed (${d.changed} downgraded)`;
+      }
     }catch(e){ this.rtMsg='Failed: '+e.message }
     await this.refresh();
   },
