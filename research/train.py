@@ -165,12 +165,17 @@ def train_residual(target: str = "spread", min_train_seasons: int = 5,
     importances = np.zeros(X.shape[1])
     n_fits = 0
 
+    n_folds = max(0, len(uniq) - min_train_seasons)
+    log.info("walk-forward: %d folds over %d games", n_folds, len(X))
+
     for i, test_season in enumerate(uniq):
         if i < min_train_seasons:
             continue
         tr, te = seasons < test_season, seasons == test_season
         if tr.sum() < 200 or te.sum() < 20:
             continue
+        log.info("  fold %d/%d — test season %d (%d train, %d test)",
+                 len(folds) + 1, n_folds, test_season, tr.sum(), te.sum())
 
         model, resid_hat = _fit_gbm(X[tr], y_resid[tr], X[te])
         p = np.clip(residual_to_cover_prob(resid_hat, sd), 0.01, 0.99)
@@ -200,11 +205,21 @@ def train_residual(target: str = "spread", min_train_seasons: int = 5,
     p_all = np.concatenate(oof_p) if oof_p else np.array([])
     y_all = np.concatenate(oof_y) if oof_y else np.array([])
 
-    leak = leakage_report(
-        seasons, X, y_binary, names,
-        lambda a, b, c: residual_to_cover_prob(_fit_gbm(a, y_resid[:len(a)], c)[1], sd)
-        if len(a) == len(y_resid[:len(a)]) else np.full(len(c), 0.5),
-        weeks=d["weeks"])
+    # Leakage probes use a FAST surrogate, deliberately.
+    #
+    # Two reasons. First, the earlier version passed `y_resid[:len(a)]` — a
+    # slice by length rather than by the actual training rows, which silently
+    # paired features with the wrong targets. Second, refitting a boosted model
+    # for every probe means ~90 fits and several minutes; leakage shows up just
+    # as clearly in a linear model, and a suite nobody waits for is a suite
+    # nobody runs.
+    def _fast_probe(Xtr, ytr, Xte):
+        from sklearn.linear_model import LogisticRegression
+        m = LogisticRegression(max_iter=300).fit(np.nan_to_num(Xtr), ytr)
+        return m.predict_proba(np.nan_to_num(Xte))[:, 1]
+
+    log.info("running leakage suite...")
+    leak = leakage_report(seasons, X, y_binary, names, _fast_probe, weeks=d["weeks"])
 
     if importances.sum() > 0:
         imp = importances / max(n_fits, 1)
