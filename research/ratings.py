@@ -54,16 +54,29 @@ MIN_PLAYS_FOR_CONFIDENCE = 120
 
 def _ridge_solve(X: np.ndarray, y: np.ndarray, w: np.ndarray,
                  alpha: float) -> np.ndarray:
-    """Weighted ridge via normal equations. The intercept is not penalised."""
+    """Weighted ridge via normal equations. The intercept is not penalised.
+
+    Guards against non-finite input: a single NaN or inf EPA propagates through
+    the matmul and silently poisons every coefficient in the fit.
+    """
+    finite = np.isfinite(y) & np.isfinite(w) & np.isfinite(X).all(axis=1)
+    if not finite.all():
+        X, y, w = X[finite], y[finite], w[finite]
+    if len(y) == 0:
+        return np.zeros(X.shape[1])
+    # Guard against underflow to zero from long decay chains
+    w = np.clip(w, 1e-6, None)
+
     Xw = X * w[:, None]
     A = X.T @ Xw
     A[np.diag_indices_from(A)] += alpha
     A[-1, -1] -= alpha                      # last column is the intercept
-    b = Xw.T @ y if Xw.shape[0] == y.shape[0] else X.T @ (w * y)
+    b = X.T @ (w * y)
     try:
-        return np.linalg.solve(A, X.T @ (w * y))
+        beta = np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
-        return np.linalg.lstsq(A, X.T @ (w * y), rcond=None)[0]
+        beta = np.linalg.lstsq(A, b, rcond=None)[0]
+    return np.nan_to_num(beta, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def fit_ratings(plays: dict[str, np.ndarray], teams: list[str],

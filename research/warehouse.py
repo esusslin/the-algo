@@ -167,10 +167,17 @@ def build(verbose: bool = True) -> dict:
     con.execute("""
         CREATE OR REPLACE TABLE player_weeks AS
         WITH team_totals AS (
+            -- Denominators must count only plays that CAN be attributed to a
+            -- player. Roughly a quarter of dropbacks are sacks, throwaways,
+            -- spikes or scrambles with no receiver — counting those makes every
+            -- target share too small and they stop summing to 1.
             SELECT game_id, offense,
-                   SUM(CASE WHEN play_class='pass' THEN 1 ELSE 0 END) AS team_targets,
-                   SUM(CASE WHEN play_class='rush' THEN 1 ELSE 0 END) AS team_carries,
-                   SUM(COALESCE(air_yards,0)) AS team_air_yards
+                   SUM(CASE WHEN play_class='pass' AND receiver_player_id IS NOT NULL
+                            THEN 1 ELSE 0 END) AS team_targets,
+                   SUM(CASE WHEN play_class='rush' AND rusher_player_id IS NOT NULL
+                            THEN 1 ELSE 0 END) AS team_carries,
+                   SUM(CASE WHEN receiver_player_id IS NOT NULL
+                            THEN COALESCE(air_yards,0) ELSE 0 END) AS team_air_yards
             FROM plays GROUP BY game_id, offense
         ),
         rec AS (

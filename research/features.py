@@ -157,11 +157,21 @@ def build_matrix(seasons: list[int] | None = None,
             "game_id": g["game_id"], "season": s, "week": w,
             "home": h, "away": a,
             "margin": margin,
-            # spread_line is stored from the home perspective, so a home -3.5
-            # favourite covers when margin + (-3.5) > 0
-            "residual": margin + spread,
-            "home_cover": 1 if (margin + spread) > 0 else 0,
-            "push": abs(margin + spread) < 1e-9,
+            # ⚠️ SIGN CONVENTION — the two data sources DISAGREE, and this is the
+            # single most dangerous detail in the codebase.
+            #
+            #   nflverse games.csv : POSITIVE spread_line = home team favoured
+            #                        (home favoured by 3.5  ->  spread_line = +3.5)
+            #   The Odds API       : NEGATIVE point = home team favoured
+            #                        (home favoured by 3.5  ->  point = -3.5)
+            #
+            # So here (nflverse) the home side covers when margin EXCEEDS the
+            # line, hence subtraction. src/picks/grading.py handles Odds API
+            # data and correctly adds. Do not "harmonise" them without checking
+            # corr(spread, margin) afterwards — it must be POSITIVE for nflverse.
+            "residual": margin - spread,
+            "home_cover": 1 if (margin - spread) > 0 else 0,
+            "push": abs(margin - spread) < 1e-9,
             "total_points": total,
             "total_residual": total - (g["total_line"] or 44.0),
             "over": 1 if total > (g["total_line"] or 44.0) else 0,
@@ -229,17 +239,18 @@ def sanity(d: dict) -> list[str]:
     # at ~50% and the mean residual merely changes sign, both of which look
     # fine. What breaks is the RELATIONSHIP between the line and the outcome.
     #
-    # spread_line is stored home-perspective, so a home favourite is negative
-    # while their margin is positive: the correlation must be strongly negative.
+    # nflverse convention: POSITIVE spread_line = home favoured, so a bigger
+    # line should go with a bigger home margin. The correlation must be POSITIVE.
+    # (The Odds API is the reverse — see the note in build_matrix.)
     margins = np.array([m["margin"] for m in meta], dtype=float)
     spreads = d["X"][:, d["names"].index("market_spread")]
     if np.std(spreads) > 1e-9:
         r_sm = float(np.corrcoef(spreads, margins)[0, 1])
-        print(f"  corr(spread, margin) : {r_sm:+.3f}   (MUST be strongly negative)")
-        if r_sm > -0.15:
+        print(f"  corr(spread, margin) : {r_sm:+.3f}   (MUST be positive — nflverse)")
+        if r_sm < 0.15:
             problems.append(
-                f"corr(spread, margin)={r_sm:+.3f} — expected strongly negative. "
-                f"The spread sign is inverted, or the line is not home-perspective. "
+                f"corr(spread, margin)={r_sm:+.3f} — expected strongly positive for "
+                f"nflverse (positive line = home favoured). The sign is inverted. "
                 f"This is the bug that produces a plausible 50% hit rate while "
                 f"silently reversing every result.")
 
