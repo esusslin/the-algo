@@ -472,6 +472,36 @@
     </div>
 
     <div class="card p-4 mb-4">
+      <p class="text-sm mb-1">Red team</p>
+      <p class="text-xs text-slate-500 mb-3">
+        Reviews pending picks for disqualifying situations. Can only downgrade —
+        never promotes or creates a pick.
+      </p>
+      <button @click="redteam()" class="w-full py-2 rounded border border-slate-600 text-xs">
+        Review picks
+      </button>
+      <p class="text-xs text-slate-400 mt-3" x-text="rtMsg"></p>
+      <div class="grid grid-cols-2 gap-y-1 text-xs mt-3 pt-3 border-t border-slate-800">
+        <span class="text-slate-500">AI configured</span>
+        <span :class="ai.configured ? 'text-slate-200' : 'text-amber-400'"
+              x-text="ai.configured ? 'yes' : 'no key set'"></span>
+        <span class="text-slate-500">spend this month</span>
+        <span class="text-slate-200"
+              x-text="'$'+(ai.month_spend_usd??0).toFixed(4)+' of $'+(ai.budget_usd??0)"></span>
+        <span class="text-slate-500">budget left</span>
+        <span class="text-slate-200" x-text="(ai.remaining_pct??100)+'%'"></span>
+      </div>
+      <div class="mt-2 space-y-1">
+        <template x-for="a in ai.by_agent||[]" :key="a.agent+a.model">
+          <div class="flex justify-between text-xs">
+            <span class="text-slate-500" x-text="a.agent"></span>
+            <span class="text-slate-600" x-text="a.n+' calls · $'+(a.cost||0).toFixed(4)"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <div class="card p-4 mb-4">
       <p class="text-sm mb-1">Demo data</p>
       <p class="text-xs text-slate-500 mb-3">
         Placeholder picks and history for UI feedback. Flagged and excluded from
@@ -536,7 +566,7 @@ function algo(){return{
   inviteCode:'', inviteValid:false, inviteReason:'',
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
-  betting:null, betForm:{book:'',price:0,stake:0}, account:false,
+  betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -639,6 +669,8 @@ function algo(){return{
       const d=await(await fetch('/api/admin/invites',{headers:this.hdr()})).json();
       this.invites=d.invites||[];
       await this.loadStatus();
+      try{ this.ai=await(await fetch('/api/admin/ai-usage',{headers:this.hdr()})).json() }
+      catch(e){ this.ai={} }
     }
     this.fresh=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   },
@@ -683,6 +715,20 @@ function algo(){return{
         this.ingestMsg='Still running after 5 min — check back shortly.';
       }
     },3000);
+  },
+  async redteam(){
+    this.rtMsg='Reviewing…';
+    try{
+      const r=await fetch('/api/admin/redteam',{method:'POST',headers:this.hdr()});
+      const d=await r.json();
+      if(!r.ok){ this.rtMsg='Failed: '+(d.detail||r.status); return }
+      const c=d.counts||{};
+      this.rtMsg = d.reviewed
+        ? `${d.reviewed} picks across ${d.games} games — ${c.OK||0} ok, `
+          +`${c.FLAG||0} flagged, ${c.KILL||0} killed (${d.changed} downgraded)`
+        : 'No pending picks to review.';
+    }catch(e){ this.rtMsg='Failed: '+e.message }
+    await this.refresh();
   },
   async demo(action){
     this.demoMsg='Working…';
