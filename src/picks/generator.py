@@ -29,11 +29,47 @@ TIER_RULES = {
     "C": dict(min_edge=2.0, min_books=8, require_sharp=False, max_dispersion=1.0),
 }
 
+# A 3% edge on a WR4 reception prop is not the same asset as 3% on a main
+# spread. Props and derivatives are noisier, carry lower limits, and are priced
+# by fewer books — so they must clear a higher bar for the same tier. Without
+# this, thin markets dominate the top of the feed purely because thin markets
+# produce bigger edge numbers.
+CLASS_MULTIPLIERS = {
+    "game": 1.0,     # moneyline, spread, total — the deepest markets
+    "period": 1.3,   # halves and quarters
+    "team": 1.3,     # team totals
+    "alt": 1.5,      # alternate ladders
+    "prop": 1.6,     # player props
+}
+
+# Book counts are naturally lower in these markets, so requiring 15 books on a
+# prop would mean no prop ever reaches A. Scale the requirement down instead.
+CLASS_BOOK_SCALE = {
+    "game": 1.0, "period": 0.7, "team": 0.7, "alt": 0.6, "prop": 0.55,
+}
+
+
+def thresholds_for(market_type: str, tier: str) -> dict:
+    """Tier rule adjusted for what class of market this is."""
+    from src.markets import describe_market
+
+    cls = describe_market(market_type).bet_class
+    r = TIER_RULES[tier]
+    return {
+        "min_edge": r["min_edge"] * CLASS_MULTIPLIERS.get(cls, 1.0),
+        "min_books": max(4, round(r["min_books"] * CLASS_BOOK_SCALE.get(cls, 1.0))),
+        # Sharp anchor is rarely available on props — Pinnacle quotes far fewer
+        # of them — so requiring it would make A-tier props impossible.
+        "require_sharp": r["require_sharp"] and cls == "game",
+        "max_dispersion": r["max_dispersion"] * (1.5 if cls == "prop" else 1.0),
+        "bet_class": cls,
+    }
+
 
 def assign_tier(opp: dict) -> str | None:
-    """A/B/C, or None if it doesn't clear the bar."""
+    """A/B/C, or None if it doesn't clear the bar for its market class."""
     for tier in ("A", "B", "C"):
-        r = TIER_RULES[tier]
+        r = thresholds_for(opp["market_type"], tier)
         if opp["edge_pct"] < r["min_edge"]:
             continue
         if opp["book_count"] < r["min_books"]:

@@ -73,6 +73,37 @@ def _link_odds_events() -> None:
         ctx["rows_affected"] = odds_api.link_events()
 
 
+def _refresh_weather() -> None:
+    from src.fetchers import weather
+    with job_run("refresh_weather") as ctx:
+        ctx["rows_affected"] = weather.refresh_upcoming()
+
+
+def _capture_closing() -> None:
+    """MUST run before kickoff — odds vanish once a game starts, and without a
+    closing price there is no CLV. Runs frequently because kickoffs are
+    staggered across the day."""
+    from src.picks.grading import capture_closing_lines
+    with job_run("capture_closing_lines") as ctx:
+        ctx["rows_affected"] = capture_closing_lines(minutes_before=12)
+
+
+def _grade() -> None:
+    from src.picks.grading import grade_picks, grade_user_bets
+    with job_run("grade_picks") as ctx:
+        counts = grade_picks()
+        ctx["rows_affected"] = counts.get("win", 0) + counts.get("loss", 0) + \
+            counts.get("push", 0)
+    with job_run("grade_user_bets") as ctx:
+        ctx["rows_affected"] = grade_user_bets()
+
+
+def _fetch_live() -> None:
+    from src.picks.live import fetch_live
+    with job_run("fetch_live") as ctx:
+        ctx["rows_affected"] = fetch_live()
+
+
 def _health_heartbeat() -> None:
     with job_run("heartbeat") as ctx:
         ctx["rows_affected"] = 1
@@ -88,6 +119,26 @@ JOBS: list[tuple] = [
     # (see odds_api.TIERS) — the 5-minute interval is an upper bound, not a rate.
     (_poll_odds, "interval", dict(minutes=5), "poll_odds"),
     (_link_odds_events, "cron", dict(day_of_week="tue", hour=8, minute=0), "link_odds_events"),
+
+    # Weather: 4x daily normally, hourly on game days when forecasts move and
+    # books are slow to reprice totals.
+    (_refresh_weather, "cron", dict(hour="2,8,14,20", minute=15), "refresh_weather"),
+    (_refresh_weather, "cron", dict(day_of_week="thu,sat,sun,mon", hour="*",
+                                    minute=15), "refresh_weather_gameday"),
+
+    # Closing lines: every 5 min so staggered kickoffs are all captured in the
+    # last ~12 minutes before they start. Missing this means no CLV, ever.
+    (_capture_closing, "interval", dict(minutes=5), "capture_closing_lines"),
+
+    # Live scores while games are in progress.
+    (_fetch_live, "cron", dict(day_of_week="thu,sat,sun,mon", hour="12-23",
+                               minute="*/2"), "fetch_live"),
+
+    # Grading: after the late window each night, then again next morning to
+    # catch stat corrections.
+    (_grade, "cron", dict(hour=3, minute=30), "grade_overnight"),
+    (_grade, "cron", dict(hour=11, minute=0), "grade_morning"),
+
     (_health_heartbeat, "interval", dict(minutes=30), "heartbeat"),
 ]
 
@@ -95,6 +146,9 @@ JOBS: list[tuple] = [
 EXPECTED_FRESHNESS = {
     "heartbeat": timedelta(hours=2),
     "poll_odds": timedelta(hours=3),
+    "capture_closing_lines": timedelta(hours=2),
+    "refresh_weather": timedelta(hours=12),
+    "grade_picks": timedelta(days=2),
     "refresh_injuries": timedelta(days=8),
     "refresh_nflverse": timedelta(days=9),
 }
