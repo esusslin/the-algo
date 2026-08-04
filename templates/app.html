@@ -200,39 +200,30 @@
 
     <p x-show="!(live.bets||[]).length && !(live.settled_today||[]).length"
        class="text-sm text-slate-500 py-12 text-center">
-      Nothing running. Tap "I bet this" on a pick and it'll show up here.
+      No open bets. Tap "I bet this" on a pick and it'll show up here.
     </p>
 
-    <template x-for="grp in [['live','Live now'],['upcoming','Not started'],['final','Awaiting grade']]" :key="grp[0]">
-      <div x-show="(live.groups?.[grp[0]]||[]).length" class="mb-5">
-        <p class="text-xs text-slate-500 mb-2 flex items-center gap-2">
-          <span x-text="grp[1]"></span>
-          <span x-show="grp[0]==='live'" class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+    <div x-show="(live.live_bets||[]).length" class="mb-5">
+      <p class="text-xs text-slate-500 mb-2 flex items-center gap-2">
+        <span>Live now</span>
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+      </p>
+      <div class="space-y-2">
+        <template x-for="b in live.live_bets" :key="b.bet_id">
+          <div class="card p-3" :class="'tier'+b.tier" x-html="betCard(b)"></div>
+        </template>
+      </div>
+    </div>
+
+    <template x-for="day in live.days||[]" :key="day.date">
+      <div class="mb-5">
+        <p class="text-xs mb-2 flex items-center justify-between">
+          <span :class="day.is_today?'text-slate-300':'text-slate-500'" x-text="day.label"></span>
+          <span class="text-slate-600" x-text="day.units.toFixed(2)+'u'"></span>
         </p>
         <div class="space-y-2">
-          <template x-for="b in live.groups[grp[0]]" :key="b.bet_id">
-            <div class="card p-3" :class="'tier'+b.tier">
-              <div class="flex items-start justify-between gap-2">
-                <span class="text-sm flex-1" x-text="b.headline"></span>
-                <span class="text-xs px-2 py-0.5 rounded shrink-0"
-                      :class="b.status==='winning'?'bg-emerald-900 text-emerald-300':b.status==='losing'?'bg-red-900 text-red-300':'bg-slate-700 text-slate-400'"
-                      x-text="b.status==='pending'?'not started':b.status"></span>
-              </div>
-              <p class="text-lg mt-2" x-show="b.home_score!==null">
-                <span x-text="b.away_team"></span>
-                <span class="text-slate-300" x-text="b.away_score"></span>
-                <span class="text-slate-600 mx-1">—</span>
-                <span x-text="b.home_team"></span>
-                <span class="text-slate-300" x-text="b.home_score"></span>
-                <span class="text-xs text-slate-500 ml-2"
-                      x-show="b.period" x-text="'Q'+b.period+' '+(b.clock||'')"></span>
-              </p>
-              <p class="text-xs mt-1"
-                 :class="b.status==='winning'?'text-emerald-400':b.status==='losing'?'text-red-400':'text-slate-500'"
-                 x-text="b.note"></p>
-              <p class="text-[11px] text-slate-600 mt-1"
-                 x-text="b.book+' '+fmtOdds(b.price)+' · '+(b.stake||0).toFixed(2)+'u'"></p>
-            </div>
+          <template x-for="b in day.bets" :key="b.bet_id">
+            <div class="card p-3" :class="'tier'+b.tier" x-html="betCard(b)"></div>
           </template>
         </div>
       </div>
@@ -507,11 +498,11 @@
             :class="tab==='picks'?'text-emerald-400':'text-slate-500'">Picks</button>
     <button @click="tab='mybets'; refresh()" class="flex-1 py-3 text-xs relative"
             :class="tab==='mybets'?'text-emerald-400':'text-slate-500'">
-      My bets
+      Open bets
       <span x-show="live.live" class="absolute top-2 right-3 w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
     </button>
     <button @click="tab='track'; refresh()" class="flex-1 py-3 text-xs"
-            :class="tab==='track'?'text-emerald-400':'text-slate-500'">Track</button>
+            :class="tab==='track'?'text-emerald-400':'text-slate-500'">History</button>
     <button @click="tab='algo'; refresh()" class="flex-1 py-3 text-xs"
             :class="tab==='algo'?'text-emerald-400':'text-slate-500'">Algo</button>
     <button x-show="user.role==='admin'" @click="tab='admin'; refresh()"
@@ -695,7 +686,27 @@ function algo(){return{
   },
 
   fmtOdds(p){return p>0?'+'+p:''+p},
-  tabTitle(){return {picks:'Picks',mybets:'My bets',track:'Track',
+  esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))},
+  betCard(b){
+    const badge = b.status==='winning' ? 'bg-emerald-900 text-emerald-300'
+      : b.status==='losing' ? 'bg-red-900 text-red-300' : 'bg-slate-700 text-slate-400';
+    const noteColor = b.status==='winning' ? 'text-emerald-400'
+      : b.status==='losing' ? 'text-red-400' : 'text-slate-500';
+    const label = b.status==='pending' ? 'not started' : b.status;
+    const score = b.home_score!==null && b.home_score!==undefined
+      ? `<p class="text-lg mt-2">${this.esc(b.away_team)} <span class="text-slate-300">${b.away_score}</span>
+         <span class="text-slate-600 mx-1">—</span> ${this.esc(b.home_team)} <span class="text-slate-300">${b.home_score}</span>
+         ${b.period?`<span class="text-xs text-slate-500 ml-2">Q${b.period} ${this.esc(b.clock||'')}</span>`:''}</p>`
+      : `<p class="text-xs text-slate-500 mt-2">${this.esc(b.away_team)} @ ${this.esc(b.home_team)}</p>`;
+    return `<div class="flex items-start justify-between gap-2">
+        <span class="text-sm flex-1">${this.esc(b.headline)}</span>
+        <span class="text-xs px-2 py-0.5 rounded shrink-0 ${badge}">${this.esc(label)}</span>
+      </div>
+      ${score}
+      <p class="text-xs mt-1 ${noteColor}">${this.esc(b.note||'')}</p>
+      <p class="text-[11px] text-slate-600 mt-1">${this.esc(b.book||'')} ${this.fmtOdds(b.price)} · ${(b.stake||0).toFixed(2)}u</p>`;
+  },
+  tabTitle(){return {picks:'Picks',mybets:'Open bets',track:'History',
                      algo:'Algorithm',admin:'Admin'}[this.tab]},
   subtitle(){
     if(this.tab==='picks'){
@@ -703,10 +714,10 @@ function algo(){return{
       return this.picks.length ? a+' A-tier · '+b+' B-tier' : 'nothing clearing threshold';
     }
     if(this.tab==='mybets'){
-      if(!this.live.open && !(this.live.settled_today||[]).length) return 'nothing running';
+      if(!this.live.open && !(this.live.settled_today||[]).length) return 'nothing open';
       const parts=[];
       if(this.live.live) parts.push(this.live.live+' live');
-      if(this.live.open) parts.push(this.live.open+' open');
+      if(this.live.open) parts.push(this.live.open+' open · '+(this.live.units_at_risk||0).toFixed(1)+'u');
       if((this.live.settled_today||[]).length)
         parts.push(((this.live.net_today||0)>=0?'+':'')+(this.live.net_today||0).toFixed(2)+'u today');
       return parts.join(' · ');

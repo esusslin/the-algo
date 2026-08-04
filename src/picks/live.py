@@ -155,23 +155,57 @@ def open_bet_status(user_id: int) -> dict:
         at_risk += r["stake"] or 0
         out.append(d)
 
-    # Group by what the user actually cares about right now: what's happening,
-    # what's about to happen, what already resolved today.
-    groups: dict[str, list] = {"live": [], "upcoming": [], "final": []}
-    for b in out:
-        state = b.get("game_state")
-        groups["live" if state == "in" else
-               "final" if state == "post" else "upcoming"].append(b)
+    # NFL runs Thu / Sun / Mon, so open bets legitimately span the week. Show
+    # everything, grouped by day, with anything live floated to the top —
+    # filtering to "today" would hide most of a user's exposure.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    now = _dt.now(_tz.utc)
+    today_d = now.date()
+
+    def kickoff_date(b: dict):
+        try:
+            ko = _dt.fromisoformat((b.get("kickoff_utc") or "").replace("Z", "+00:00"))
+            return (ko if ko.tzinfo else ko.replace(tzinfo=_tz.utc)).date()
+        except ValueError:
+            return None
+
+    live_bets = [b for b in out if b.get("game_state") == "in"]
+    rest = [b for b in out if b.get("game_state") != "in"]
+
+    days: dict[str, dict] = {}
+    for b in rest:
+        d = kickoff_date(b)
+        key = d.isoformat() if d else "unknown"
+        if key not in days:
+            delta = (d - today_d).days if d else None
+            days[key] = {
+                "date": key,
+                "label": ("Today" if delta == 0 else
+                          "Tomorrow" if delta == 1 else
+                          "Yesterday" if delta == -1 else
+                          d.strftime("%a %b %-d") if d else "Date unknown"),
+                "is_today": delta == 0,
+                "bets": [], "units": 0.0,
+            }
+        days[key]["bets"].append(b)
+        days[key]["units"] = round(days[key]["units"] + (b["stake"] or 0), 3)
+
+    today_bets = [b for b in out if kickoff_date(b) == today_d
+                  or b.get("game_state") in ("in", "post")]
 
     return {
         "open": len(out),
-        "live": live_count,
-        "winning": winning,
+        "live": len(live_bets),
+        "winning": sum(1 for b in out if b.get("status") == "winning"),
         "losing": sum(1 for b in out if b.get("status") == "losing"),
         "units_at_risk": round(at_risk, 3),
         "units_winning": round(
             sum(b["stake"] or 0 for b in out if b.get("status") == "winning"), 3),
-        "groups": groups,
+        # today's slice, for the header
+        "today_open": len(today_bets),
+        "today_units": round(sum(b["stake"] or 0 for b in today_bets), 3),
+        "live_bets": live_bets,
+        "days": sorted(days.values(), key=lambda d: d["date"]),
         "bets": out,
     }
 
