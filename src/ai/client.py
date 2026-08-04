@@ -73,7 +73,7 @@ def _log_call(agent: str, model: str, tin: int, tout: int,
 
 def complete(prompt: str, *, agent: str, model: str | None = None,
              system: str = "", max_tokens: int = 800,
-             temperature: float = 0.0,
+             temperature: float | None = None,
              ref_type: str = "", ref_id: str = "",
              min_budget_pct: float = 2.0) -> str:
     """One completion. Raises AIUnavailable rather than returning junk."""
@@ -90,9 +90,13 @@ def complete(prompt: str, *, agent: str, model: str | None = None,
         client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         kwargs: dict[str, Any] = {
             "model": model, "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
+        # `temperature` is rejected by newer models. Only send it when a caller
+        # explicitly asks for one, so this doesn't break again on the next
+        # model release.
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if system:
             kwargs["system"] = system
         resp = client.messages.create(**kwargs)

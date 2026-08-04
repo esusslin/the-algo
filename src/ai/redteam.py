@@ -24,6 +24,7 @@ the expensive part is the situational picture, not the individual bet.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from src.ai.client import AIUnavailable, complete_json
@@ -151,7 +152,7 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     try:
         out = complete_json(
             _prompt(pick, ctx), agent="redteam", system=SYSTEM,
-            model=settings.MODEL_REASON, max_tokens=300, temperature=0.0,
+            model=settings.MODEL_REASON, max_tokens=300,
             ref_type="pick", ref_id=str(pick.get("pick_id", "")))
     except AIUnavailable as exc:
         # FAIL OPEN. A broken AI layer must not suppress the slate — but the
@@ -196,7 +197,16 @@ def review_slate(picks: list[dict]) -> dict:
         sources[r.get("source", "?")] = sources.get(r.get("source", "?"), 0) + 1
 
     reviewed_by_model = sources.get("model", 0)
-    errors = sorted({r["error"] for r in results.values() if r.get("error")})
+    # Collapse identical failures. Every call carries a unique request_id, so
+    # naive dedup leaves you with N copies of the same message.
+    seen: dict[str, int] = {}
+    for r in results.values():
+        if not r.get("error"):
+            continue
+        key = re.sub(r"'request_id': '[^']*'", "'request_id': '...'", r["error"])
+        seen[key] = seen.get(key, 0) + 1
+    errors = [f"{k}" + (f"  (x{n})" if n > 1 else "")
+              for k, n in sorted(seen.items(), key=lambda kv: -kv[1])][:3]
     return {"reviewed": len(picks), "games": len(contexts),
             "counts": counts, "results": results,
             "sources": sources,
