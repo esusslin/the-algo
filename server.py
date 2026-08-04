@@ -65,6 +65,10 @@ def _poll_odds() -> None:
         with job_run("generate_picks") as ctx:
             from src.picks.generator import generate
             ctx["rows_affected"] = generate(source="market_engine")["written"]
+        if settings.ENABLE_AI_REDTEAM:
+            with job_run("redteam_review") as ctx:
+                from src.ai.redteam import apply_to_picks
+                ctx["rows_affected"] = apply_to_picks().get("changed", 0)
 
 
 def _link_odds_events() -> None:
@@ -614,6 +618,18 @@ def make_invite(request: Request, body: InviteBody,
         inv["sms"] = send_invite(inv["code"], body.phone,
                                  str(request.base_url), inviter=admin["username"])
     return inv
+
+
+@app.get("/api/admin/ai-usage")
+def ai_usage(admin: dict = Depends(auth.current_admin)) -> dict:
+    from src.ai.client import usage_summary
+    return usage_summary()
+
+
+@app.post("/api/admin/redteam")
+def run_redteam(admin: dict = Depends(auth.current_admin)) -> dict:
+    from src.ai.redteam import apply_to_picks
+    return apply_to_picks()
 
 
 @app.get("/api/admin/sms-status")
