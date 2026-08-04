@@ -104,16 +104,40 @@ def authenticate(username: str, password: str) -> dict | None:
 
 
 def bootstrap_admin() -> int | None:
-    """Create the admin account from env on first boot. Idempotent."""
+    """Create or re-sync the admin account from env on every boot.
+
+    The env vars are AUTHORITATIVE. An earlier version created the account once
+    and then returned early forever, so changing ADMIN_PASSWORD in Railway had
+    no effect and you were locked out with no way to tell why. Now each boot
+    reconciles password, phone and role against the environment — which also
+    means changing the var is a working recovery path if you forget it.
+    """
     if not (settings.ADMIN_USERNAME and settings.ADMIN_PASSWORD):
         return None
+
     existing = get_user(settings.ADMIN_USERNAME)
-    if existing:
-        return existing["id"]
-    uid = create_user(settings.ADMIN_USERNAME, settings.ADMIN_PASSWORD,
-                      role="admin", phone=settings.ADMIN_PHONE or None)
-    log.info("bootstrapped admin user %r", settings.ADMIN_USERNAME)
-    return uid
+    if not existing:
+        uid = create_user(settings.ADMIN_USERNAME, settings.ADMIN_PASSWORD,
+                          role="admin", phone=settings.ADMIN_PHONE or None)
+        log.info("bootstrapped admin user %r", settings.ADMIN_USERNAME)
+        return uid
+
+    changed = []
+    with db() as conn:
+        if not verify_password(settings.ADMIN_PASSWORD, existing["password_hash"]):
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                         (hash_password(settings.ADMIN_PASSWORD), existing["id"]))
+            changed.append("password")
+        if settings.ADMIN_PHONE and existing["phone"] != settings.ADMIN_PHONE:
+            conn.execute("UPDATE users SET phone=? WHERE id=?",
+                         (settings.ADMIN_PHONE, existing["id"]))
+            changed.append("phone")
+        if existing["role"] != "admin":
+            conn.execute("UPDATE users SET role='admin' WHERE id=?", (existing["id"],))
+            changed.append("role")
+    if changed:
+        log.info("admin account re-synced from env: %s", ", ".join(changed))
+    return existing["id"]
 
 
 # --------------------------------------------------------------------------
