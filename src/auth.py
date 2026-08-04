@@ -158,6 +158,80 @@ def redeem_invite(code: str, username: str, password: str,
     return {"user_id": user_id, "username": user["username"], "role": user["role"]}
 
 
+# --------------------------------------------------------------------------
+# password reset
+# --------------------------------------------------------------------------
+RESET_TTL_MINUTES = 60
+
+
+def create_reset(user_id: int, issued_by: str = "self") -> dict:
+    """Mint a single-use reset token.
+
+    Any outstanding tokens for this user are invalidated first — otherwise an
+    older link sitting in someone's messages stays live alongside the new one.
+    """
+    token = secrets.token_urlsafe(24)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=RESET_TTL_MINUTES)
+               ).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute("UPDATE password_resets SET used_at=? WHERE user_id=? "
+                     "AND used_at IS NULL", (utcnow(), user_id))
+        insert_row(conn, "password_resets", {
+            "token": token, "user_id": user_id, "created_at": utcnow(),
+            "expires_at": expires, "issued_by": issued_by,
+        })
+    return {"token": token, "expires_at": expires}
+
+
+def check_reset(token: str) -> tuple[bool, str]:
+    row = query_one("SELECT * FROM password_resets WHERE token=?", (token.strip(),))
+    if not row:
+        return False, "reset link not found"
+    if row["used_at"]:
+        return False, "reset link already used"
+    if (row["expires_at"] or "") < utcnow():
+        return False, "reset link expired"
+    return True, "ok"
+
+
+def redeem_reset(token: str, new_password: str) -> dict:
+    ok, reason = check_reset(token)
+    if not ok:
+        raise ValueError(reason)
+    if len(new_password) < 8:
+        raise ValueError("password must be at least 8 characters")
+    row = query_one("SELECT user_id FROM password_resets WHERE token=?", (token.strip(),))
+    uid = int(row["user_id"])
+    with db() as conn:
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                     (hash_password(new_password), uid))
+        conn.execute("UPDATE password_resets SET used_at=? WHERE token=?",
+                     (utcnow(), token.strip()))
+    user = get_user_by_id(uid)
+    log.info("password reset completed for user %s", user["username"])
+    return {"user_id": uid, "username": user["username"], "role": user["role"]}
+
+
+def request_reset(username_or_phone: str) -> dict:
+    """Self-serve reset. Returns the token only if we can deliver it by SMS.
+
+    Deliberately vague on failure: revealing whether an account exists lets
+    someone enumerate your users.
+    """
+    ident = username_or_phone.strip().lower()
+    row = query_one("SELECT * FROM users WHERE LOWER(username)=?", (ident,))
+    if not row:
+        digits = "".join(c for c in ident if c.isdigit())
+        if len(digits) >= 10:
+            row = query_one("SELECT * FROM users WHERE REPLACE(REPLACE(REPLACE("
+                            "REPLACE(phone,'+',''),'-',''),' ',''),'()','') LIKE ?",
+                            (f"%{digits[-10:]}%",))
+    if not row or not row["phone"]:
+        return {"sent": False, "reason": "no_phone"}
+    return {"sent": True, "user_id": row["id"], "phone": row["phone"],
+            **create_reset(row["id"], issued_by="self")}
+
+
 def list_invites() -> list[dict]:
     rows = query(
         "SELECT i.*, u.username AS used_by_username FROM invites i "

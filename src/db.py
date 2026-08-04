@@ -526,6 +526,21 @@ MIGRATIONS: list[tuple[int, str]] = [
         sent_at    TEXT
     );
     """),
+
+    (6, """
+    -- Single-use password reset tokens. Short TTL, consumed on use, and
+    -- invalidated in bulk when a user resets — so an old link in someone's
+    -- texts can't be replayed later.
+    CREATE TABLE IF NOT EXISTS password_resets (
+        token       TEXT PRIMARY KEY,
+        user_id     INTEGER NOT NULL,
+        created_at  TEXT,
+        expires_at  TEXT,
+        used_at     TEXT,
+        issued_by   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_resets_user ON password_resets(user_id, used_at);
+    """),
 ]
 
 

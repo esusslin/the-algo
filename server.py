@@ -381,10 +381,96 @@ def register(body: RegisterBody) -> dict:
     }
 
 
+class ResetRequestBody(BaseModel):
+    identifier: str          # username or phone
+
+
+class ResetBody(BaseModel):
+    token: str
+    password: str
+
+
+@app.post("/api/auth/forgot")
+def forgot_password(request: Request, body: ResetRequestBody) -> dict:
+    """Self-serve reset by SMS.
+
+    Always returns the same shape regardless of whether the account exists —
+    otherwise this endpoint becomes a way to enumerate your users.
+    """
+    r = auth.request_reset(body.identifier)
+    if r.get("sent"):
+        from src.notify.sms import send_reset
+        sms = send_reset(r["token"], r["phone"], str(request.base_url))
+        if sms["status"] != "sent":
+            log.warning("reset SMS failed: %s", sms.get("error"))
+    return {"ok": True,
+            "message": "If that account exists and has a phone on file, "
+                       "a reset link has been sent."}
+
+
+@app.get("/api/auth/reset/{token}")
+def check_reset(token: str) -> dict:
+    ok, reason = auth.check_reset(token)
+    return {"valid": ok, "reason": reason}
+
+
+@app.post("/api/auth/reset")
+def do_reset(body: ResetBody) -> dict:
+    try:
+        user = auth.redeem_reset(body.token, body.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"token": auth.create_token(user["user_id"], user["username"],
+                                       user["role"]), "user": user}
+
+
+@app.post("/api/admin/reset-link/{user_id}")
+def admin_reset_link(request: Request, user_id: int,
+                     admin: dict = Depends(auth.current_admin)) -> dict:
+    """Admin-issued reset — the fallback when someone has no phone on file."""
+    u = auth.get_user_by_id(user_id)
+    if not u:
+        raise HTTPException(404, "user not found")
+    r = auth.create_reset(user_id, issued_by=admin["username"])
+    link = f"{str(request.base_url).rstrip('/')}/app?reset={r['token']}"
+    out = {"username": u["username"], "link": link, "expires_at": r["expires_at"]}
+    if u["phone"]:
+        from src.notify.sms import send_reset
+        out["sms"] = send_reset(r["token"], u["phone"], str(request.base_url))
+    return out
+
+
+class ProfileBody(BaseModel):
+    phone: str | None = None
+    sms_opt_in: bool | None = None
+
+
 @app.get("/api/auth/me")
 def me(user: dict = Depends(auth.current_user)) -> dict:
     return {"id": user["id"], "username": user["username"], "role": user["role"],
-            "sms_opt_in": user["sms_opt_in"]}
+            "phone": user["phone"], "sms_opt_in": user["sms_opt_in"],
+            "can_self_reset": bool(user["phone"])}
+
+
+@app.patch("/api/auth/me")
+def update_profile(body: ProfileBody,
+                   user: dict = Depends(auth.current_user)) -> dict:
+    """Let users add a phone after signup.
+
+    Without this, anyone who registered before phone collection existed can
+    never self-serve a password reset — they'd need an admin every time.
+    """
+    from src.notify.sms import normalize_phone
+    with db() as conn:
+        if body.phone is not None:
+            conn.execute("UPDATE users SET phone=? WHERE id=?",
+                         (normalize_phone(body.phone) or None, user["id"]))
+        if body.sms_opt_in is not None:
+            conn.execute("UPDATE users SET sms_opt_in=? WHERE id=?",
+                         (1 if body.sms_opt_in else 0, user["id"]))
+    u = auth.get_user_by_id(user["id"])
+    return {"phone": u["phone"], "sms_opt_in": u["sms_opt_in"],
+            "can_self_reset": bool(u["phone"])}
 
 
 # ==========================================================================

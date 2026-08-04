@@ -76,6 +76,13 @@ def send_invite(code: str, phone: str, base_url: str, inviter: str = "") -> dict
     return send(phone, body, ref=code, channel="invite")
 
 
+def send_reset(token: str, phone: str, base_url: str) -> dict:
+    link = f"{base_url.rstrip('/')}/app?reset={token}"
+    body = (f"Reset your Algo password:\n\n{link}\n\n"
+            f"Expires in 1 hour. If you didn't ask for this, ignore it.")
+    return send(phone, body, ref=token[:12], channel="reset")
+
+
 def send_pick_alert(phone: str, headline: str, book: str, price: int,
                     base_url: str) -> dict:
     body = (f"A-tier: {headline}\n{book} {price:+d}\n"

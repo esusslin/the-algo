@@ -37,14 +37,65 @@
          x-text="inviteValid ? 'Invite valid' : inviteReason"></div>
   </template>
 
-  <input x-model="form.username" placeholder="username" autocapitalize="none" autocomplete="username"
-         class="w-full mb-3 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
-  <input x-model="form.password" type="password" placeholder="password" autocomplete="current-password"
-         class="w-full mb-4 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
-  <button @click="inviteCode ? register() : login()"
-          class="w-full py-3 rounded bg-emerald-600 text-white font-medium"
-          x-text="inviteCode ? 'Create account' : 'Sign in'"></button>
-  <p class="text-red-400 text-sm mt-3" x-text="error"></p>
+  <!-- reset flow -->
+  <template x-if="resetToken">
+    <div>
+      <div class="mb-4 text-xs px-3 py-2 rounded"
+           :class="resetValid ? 'bg-emerald-900/40 text-emerald-300' : 'bg-red-900/40 text-red-300'"
+           x-text="resetValid ? 'Choose a new password' : resetReason"></div>
+      <input x-model="form.password" type="password" placeholder="new password (8+ characters)"
+             autocomplete="new-password"
+             class="w-full mb-4 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+      <button @click="doReset()" class="w-full py-3 rounded bg-emerald-600 text-white font-medium">
+        Set password
+      </button>
+      <p class="text-red-400 text-sm mt-3" x-text="error"></p>
+    </div>
+  </template>
+
+  <!-- forgot flow -->
+  <template x-if="!resetToken && forgot">
+    <div>
+      <p class="text-xs text-slate-400 mb-3">
+        Enter your username or phone number. If we have a phone on file we'll
+        text you a reset link.
+      </p>
+      <input x-model="forgotId" placeholder="username or phone" autocapitalize="none"
+             class="w-full mb-4 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+      <button @click="requestReset()" class="w-full py-3 rounded bg-emerald-600 text-white font-medium">
+        Send reset link
+      </button>
+      <p class="text-slate-400 text-sm mt-3" x-text="forgotMsg"></p>
+      <button @click="forgot=false; forgotMsg=''" class="text-xs text-slate-500 mt-4">Back to sign in</button>
+    </div>
+  </template>
+
+  <!-- login / register -->
+  <template x-if="!resetToken && !forgot">
+    <div>
+      <input x-model="form.username" placeholder="username" autocapitalize="none" autocomplete="username"
+             class="w-full mb-3 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+      <input x-model="form.password" type="password" placeholder="password"
+             :autocomplete="inviteCode ? 'new-password' : 'current-password'"
+             class="w-full mb-3 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+      <template x-if="inviteCode">
+        <div>
+          <input x-model="form.phone" type="tel" placeholder="mobile number (for alerts and password reset)"
+                 autocomplete="tel"
+                 class="w-full mb-1 px-3 py-3 rounded bg-slate-800/60 border border-slate-700 text-base">
+          <p class="text-[11px] text-slate-500 mb-4">
+            Optional, but without it you'll need an admin to reset your password.
+          </p>
+        </div>
+      </template>
+      <button @click="inviteCode ? register() : login()"
+              class="w-full py-3 rounded bg-emerald-600 text-white font-medium mt-1"
+              x-text="inviteCode ? 'Create account' : 'Sign in'"></button>
+      <p class="text-red-400 text-sm mt-3" x-text="error"></p>
+      <button x-show="!inviteCode" @click="forgot=true"
+              class="text-xs text-slate-500 mt-4">Forgot password?</button>
+    </div>
+  </template>
 </div>
 
 <!-- ============ app ============ -->
@@ -167,6 +218,21 @@
         <span x-text="hist.summary.win_rate_ci[0]+'% – '+hist.summary.win_rate_ci[1]+'%'"></span>.
         CLV is the number to trust at this sample size.
       </p>
+    </div>
+
+    <div class="card p-4 mb-4">
+      <p class="text-sm mb-1">Account</p>
+      <p class="text-xs mb-3"
+         :class="user.can_self_reset ? 'text-slate-500' : 'text-amber-400'"
+         x-text="user.can_self_reset
+           ? 'Mobile on file — you can reset your own password.'
+           : 'No mobile on file. Add one so you can reset your own password.'"></p>
+      <div class="flex gap-2">
+        <input x-model="profilePhone" type="tel" placeholder="mobile number"
+               class="flex-1 px-3 py-2 rounded bg-slate-800/60 border border-slate-700 text-sm">
+        <button @click="saveProfile()" class="px-4 py-2 rounded border border-slate-600 text-xs">Save</button>
+      </div>
+      <p class="text-xs text-slate-400 mt-2" x-text="profileMsg"></p>
     </div>
 
     <p class="text-xs text-slate-500 mb-2">Settled</p>
@@ -347,14 +413,22 @@
 function algo(){return{
   token:localStorage.getItem('algo_token')||'', user:{}, tab:'picks', scope:'mine',
   filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[], algo:{},
-  form:{username:'',password:''}, error:'', fresh:'', inviteCode:'', inviteValid:false, inviteReason:'',
-  busy:'', ingestMsg:'', demoMsg:'',
+  form:{username:'',password:'',phone:''}, error:'', fresh:'',
+  inviteCode:'', inviteValid:false, inviteReason:'',
+  resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
+  busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'',
 
   async boot(){
-    const q=new URLSearchParams(location.search); this.inviteCode=q.get('invite')||'';
+    const q=new URLSearchParams(location.search);
+    this.inviteCode=q.get('invite')||''; this.resetToken=q.get('reset')||'';
     if(this.inviteCode){
       const r=await(await fetch('/api/auth/invite/'+this.inviteCode)).json();
       this.inviteValid=r.valid; this.inviteReason=r.reason;
+    }
+    if(this.resetToken){
+      this.token=''; localStorage.removeItem('algo_token');
+      const r=await(await fetch('/api/auth/reset/'+this.resetToken)).json();
+      this.resetValid=r.valid; this.resetReason=r.reason;
     }
     if(this.token) await this.refresh();
     setInterval(()=>{if(this.token&&this.tab==='track')this.loadLive()},30000);
@@ -379,11 +453,40 @@ function algo(){return{
     history.replaceState({},'','/app'); this.inviteCode=''; await this.refresh();
   },
 
+  async saveProfile(){
+    this.profileMsg='Saving…';
+    const r=await fetch('/api/auth/me',{method:'PATCH',headers:this.hdr(),
+      body:JSON.stringify({phone:this.profilePhone})});
+    const d=await r.json();
+    if(r.ok){ this.user.can_self_reset=d.can_self_reset; this.user.phone=d.phone;
+      this.profileMsg = d.phone ? 'Saved — '+d.phone : 'Removed.'; }
+    else this.profileMsg='Could not save.';
+  },
+  async requestReset(){
+    this.forgotMsg='Sending…';
+    const r=await(await fetch('/api/auth/forgot',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({identifier:this.forgotId})})).json();
+    this.forgotMsg=r.message;
+  },
+  async doReset(){
+    this.error='';
+    const r=await fetch('/api/auth/reset',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:this.resetToken,password:this.form.password})});
+    const d=await r.json();
+    if(!r.ok){this.error=d.detail||'Could not reset password';return}
+    this.token=d.token; this.user=d.user; localStorage.setItem('algo_token',d.token);
+    history.replaceState({},'','/app'); this.resetToken=''; this.form.password='';
+    await this.refresh();
+  },
+
   async refresh(){
     if(!this.token)return;
     const me=await fetch('/api/auth/me',{headers:this.hdr()});
     if(me.status===401){this.token='';localStorage.removeItem('algo_token');return}
     this.user=await me.json();
+    if(!this.profilePhone) this.profilePhone=this.user.phone||'';
     if(!this.filters.length||this.filters.length===1){
       const f=await(await fetch('/api/history/filters',{headers:this.hdr()})).json();
       const by=Object.fromEntries(f.options.map(o=>[o.key,o]));
