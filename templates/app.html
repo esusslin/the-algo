@@ -173,12 +173,39 @@
             </div>
             <p class="text-xs text-slate-500 mb-1" x-text="p.matchup + ' · ' + p.market_label"></p>
             <p class="text-[13px] text-slate-400 leading-snug" x-text="p.detail"></p>
+            <button @click="showWhy = (showWhy===p.pick_id ? null : p.pick_id)"
+                    class="text-[11px] text-slate-500 mt-1"
+                    x-text="showWhy===p.pick_id ? 'hide detail' : 'where does this number come from?'"></button>
           </div>
         </div>
-        <div class="flex items-center gap-3 mt-3 text-[13px]">
+
+        <div x-show="showWhy===p.pick_id" class="mt-2 pt-2 border-t border-slate-800">
+          <div class="grid grid-cols-2 gap-y-1 text-[11px]">
+            <span class="text-slate-500">win probability</span>
+            <span class="text-slate-200"
+                  x-text="((p.blended_prob ?? 0)*100).toFixed(2)+'%'"></span>
+            <span class="text-slate-500">source</span>
+            <span class="text-slate-300" x-text="p.prob_source || 'market'"></span>
+            <template x-for="(v,k) in probParts(p)" :key="k">
+              <template x-if="true">
+                <div class="contents">
+                  <span class="text-slate-500" x-text="k.replace(/_/g,' ')"></span>
+                  <span class="text-slate-300" x-text="v"></span>
+                </div>
+              </template>
+            </template>
+            <span class="text-slate-500">ai review</span>
+            <span :class="p.ai_verdict==='OK' ? 'text-slate-300' : 'text-amber-400'"
+                  x-text="p.ai_verdict || '—'"></span>
+          </div>
+          <p x-show="p.ai_reason" class="text-[11px] text-amber-400 mt-1" x-text="p.ai_reason"></p>
+        </div>
+        <div class="flex items-center gap-3 mt-3 text-[13px] flex-wrap">
           <span class="font-medium" x-text="fmtOdds(p.best_price)"></span>
           <span class="text-slate-400" x-text="p.best_book"></span>
-          <span class="text-emerald-400" x-text="p.edge_pct.toFixed(1)+'%'"></span>
+          <span class="text-slate-200"
+                x-text="((p.blended_prob ?? p.fair_prob ?? 0)*100).toFixed(1)+'% to win'"></span>
+          <span class="text-emerald-400" x-text="p.edge_pct.toFixed(1)+'% edge'"></span>
           <span class="text-slate-500" x-text="p.kelly_units.toFixed(2)+'u'"></span>
           <button @click="openBet(p)" x-show="!p.i_bet_this && betting!==p.pick_id"
                   class="ml-auto text-xs px-3 py-1.5 rounded border border-slate-600">I bet this</button>
@@ -567,6 +594,7 @@ function algo(){return{
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
   betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
+  showWhy:null,
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -760,6 +788,20 @@ function algo(){return{
   },
 
   fmtOdds(p){return p>0?'+'+p:''+p},
+  probParts(p){
+    // Renders whatever fed the probability, so new components appear here
+    // automatically as they're added upstream — no UI change needed.
+    let c={};
+    try{ c = p.prob_components ? JSON.parse(p.prob_components) : {} }catch(e){}
+    const out={};
+    for(const [k,v] of Object.entries(c)){
+      if(v===null||v===undefined) continue;
+      out[k] = (k.includes('prob')||k==='market_fair'||k==='model')
+        ? (v*100).toFixed(2)+'%'
+        : (typeof v==='number' ? (Number.isInteger(v)?v:v.toFixed(3)) : v);
+    }
+    return out;
+  },
   esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))},
   betCard(b){
     const badge = b.status==='winning' ? 'bg-emerald-900 text-emerald-300'

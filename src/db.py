@@ -541,6 +541,16 @@ MIGRATIONS: list[tuple[int, str]] = [
     );
     CREATE INDEX IF NOT EXISTS idx_resets_user ON password_resets(user_id, used_at);
     """),
+
+    (7, """
+    -- Probability provenance. `blended_prob` is ALWAYS the number shown to
+    -- users and always the output of the full current pipeline. These columns
+    -- record what fed it, so the displayed figure stays correct as components
+    -- are added rather than needing the UI changed each time.
+    ALTER TABLE picks ADD COLUMN model_prob REAL;
+    ALTER TABLE picks ADD COLUMN prob_source TEXT DEFAULT 'market';
+    ALTER TABLE picks ADD COLUMN prob_components TEXT;
+    """),
 ]
 
 

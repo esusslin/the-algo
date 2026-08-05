@@ -11,6 +11,7 @@ data before anyone bets them.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -96,6 +97,46 @@ def visibility_for(tier: str, source: str) -> tuple[int, str]:
     return 1, "all"
 
 
+def blended_probability(opp: dict) -> dict:
+    """The single number shown to users, plus a record of what produced it.
+
+    CONTRACT: `blended_prob` is always the output of the full current pipeline.
+    Today that is the market fair price alone. As components land — model
+    probabilities, then a per-market-class blend weight — they compose here and
+    nowhere else, so the displayed figure stays correct without touching the UI.
+
+    Adding a component means: compute it, add it to `components`, fold it into
+    `prob`, and extend `source`. Do not blend anywhere else.
+    """
+    market_prob = opp.get("fair_prob") or 0.5
+    components = {
+        "market_fair": round(market_prob, 4),
+        "anchor": opp.get("anchor", "consensus"),
+        "book_count": opp.get("book_count"),
+        "dispersion": round(opp.get("dispersion") or 0.0, 4),
+    }
+    prob, source = market_prob, "market"
+
+    model_prob = opp.get("model_prob")
+    if model_prob is not None and settings.PUBLISH_MODEL_PICKS:
+        # Blend in log-odds space, weight per market class. w stays small for
+        # full-game markets until live CLV earns more — see IN_SEASON_LEARNING.md
+        import math
+        w = opp.get("blend_weight", 0.0)
+        if w > 0:
+            def logit(p: float) -> float:
+                p = min(max(p, 1e-6), 1 - 1e-6)
+                return math.log(p / (1 - p))
+            z = w * logit(model_prob) + (1 - w) * logit(market_prob)
+            prob = 1 / (1 + math.exp(-z))
+            components["model"] = round(model_prob, 4)
+            components["blend_weight"] = round(w, 3)
+            source = "market+model"
+
+    return {"prob": prob, "source": source, "components": components,
+            "model_prob": model_prob}
+
+
 def describe(opp: dict) -> tuple[str, str]:
     """Fallback headline/detail. Replaced by the LLM narrator (agent A3) later."""
     market = opp["market_type"].replace("_", " ")
@@ -161,12 +202,16 @@ def generate(source: str = "market_engine",
                     continue
                 published, vis = visibility_for(p["tier"], source)
                 headline, detail = describe(p)
+                bp = blended_probability(p)
                 insert_row(conn, "picks", {
                     "game_id": p["game_id"], "market_type": p["market_type"],
                     "player_id": p["player_id"], "side": p["side"], "line": p["line"],
                     "source": source,
                     "best_book": p["best_book"], "best_price": p["best_price"],
-                    "fair_prob": p["fair_prob"], "blended_prob": p["fair_prob"],
+                    "fair_prob": p["fair_prob"], "blended_prob": bp["prob"],
+                    "model_prob": bp["model_prob"],
+                    "prob_source": bp["source"],
+                    "prob_components": json.dumps(bp["components"]),
                     "edge_pct": p["edge_pct"],
                     "kelly_units": round(p["stake"], 6),
                     "tier": p["tier"],
