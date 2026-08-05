@@ -119,32 +119,52 @@ def build_player_history(min_season: int = 2016) -> dict[str, Any]:
         ORDER BY pw.player_id, pw.season, pw.week
     """, [min_season]).fetchall()
 
-    # actual yardage outcomes, for training the efficiency distribution
+    # Actual outcomes. nflverse renames stat columns across releases, so resolve
+    # them from what's present rather than hardcoding — a missing column here
+    # silently produces zero projections, which is how `receptions` failed.
+    stat_idx: dict[tuple, dict] = {}
     try:
-        stats = con.execute("""
-            SELECT player_id, season, week,
-                   receiving_yards, receptions, rushing_yards, carries AS rush_att,
-                   passing_yards
-            FROM stats_player
-            WHERE season >= ?
-        """, [min_season]).fetchall()
-        stat_idx = {(r[0], r[1], r[2]): r for r in stats}
-    except Exception as exc:  # noqa: BLE001 — column names vary across releases
-        log.warning("stats_player unavailable or reshaped (%s) — efficiency will "
-                    "come from EPA proxies only", exc)
-        stat_idx = {}
+        cols = {d[0] for d in con.execute(
+            "SELECT * FROM stats_player LIMIT 0").description}
+
+        def pick(*cands: str) -> str | None:
+            return next((c for c in cands if c in cols), None)
+
+        mapping = {
+            "rec_yards": pick("receiving_yards", "rec_yards", "receiving_yds"),
+            "receptions": pick("receptions", "rec", "receptions_total"),
+            "rush_yards": pick("rushing_yards", "rush_yards", "rushing_yds"),
+            "pass_yards": pick("passing_yards", "pass_yards", "passing_yds"),
+        }
+        pid = pick("player_id", "gsis_id")
+        missing = [k for k, v in mapping.items() if not v]
+        if missing:
+            log.warning("stats_player has no column for: %s (available sample: %s)",
+                        ", ".join(missing), sorted(cols)[:12])
+
+        sel = ", ".join(f"{v} AS {k}" for k, v in mapping.items() if v)
+        if pid and sel:
+            rows_s = con.execute(
+                f"SELECT {pid} AS player_id, season, week, {sel} "
+                f"FROM stats_player WHERE season >= ?", [min_season]).fetchall()
+            names = ["player_id", "season", "week"] + [k for k, v in mapping.items() if v]
+            for r in rows_s:
+                d = dict(zip(names, r))
+                stat_idx[(d["player_id"], d["season"], d["week"])] = d
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stats_player unreadable (%s) — no outcome data", exc)
     con.close()
 
     by_player: dict[str, list[dict]] = {}
     for r in rows:
-        s = stat_idx.get((r[4], r[0], r[1]))
+        s = stat_idx.get((r[4], r[0], r[1])) or {}
         by_player.setdefault(r[4], []).append({
             "season": r[0], "week": r[1], "game_id": r[2], "team": r[3],
             "targets": r[5] or 0, "carries": r[6] or 0, "air_yards": r[7] or 0,
             "target_share": r[8], "carry_share": r[9],
-            "rec_yards": (s[3] if s else None),
-            "receptions": (s[4] if s else None),
-            "rush_yards": (s[5] if s else None),
+            "rec_yards": s.get("rec_yards"),
+            "receptions": s.get("receptions"),
+            "rush_yards": s.get("rush_yards"),
         })
     log.info("player history: %d players, %d player-weeks",
              len(by_player), sum(len(v) for v in by_player.values()))
@@ -210,8 +230,69 @@ def project(history: list[dict], stat: str, player_id: str,
         n_games=n, confident=n >= 6)
 
 
+@dataclass
+class Calibration:
+    """Empirical correction fitted from past seasons.
+
+    Two parameters, both necessary:
+
+    `bias`    projections systematically ran ~3.5 yards high on receiving. The
+              cause is structural: a player's historical average includes their
+              healthy games, but the projected week may be one where they leave
+              early or see reduced snaps. That asymmetry does not cancel out.
+
+    `sd_scale` the raw compounded variance was too wide — 80% of actuals landed
+              inside one sd where 68% should. Compounding volume and efficiency
+              variance double-counts, because game-to-game efficiency swings
+              already embed volume effects. Scaling by the observed z spread
+              fixes it directly rather than guessing at the covariance.
+    """
+    stat: str
+    bias: float = 0.0
+    sd_scale: float = 1.0
+    n: int = 0
+
+    def apply(self, p: PropProjection) -> PropProjection:
+        return PropProjection(
+            player_id=p.player_id, stat=p.stat,
+            volume_mean=p.volume_mean, volume_sd=p.volume_sd,
+            eff_mean=p.eff_mean, eff_sd=p.eff_sd,
+            mean=max(0.1, p.mean + self.bias),
+            sd=max(0.1, p.sd * self.sd_scale),
+            n_games=p.n_games, confident=p.confident)
+
+
+def fit_calibration(stat: str, hist: dict[str, list[dict]],
+                    through_season: int, min_mean: float = 20.0) -> Calibration:
+    """Fit bias and spread correction on seasons STRICTLY BEFORE the target.
+
+    Calibrating on the same data you evaluate would be exactly the leak the
+    validation suite exists to catch.
+    """
+    key = {"rec_yards": "rec_yards", "rush_yards": "rush_yards",
+           "receptions": "receptions"}[stat]
+    errs, zs = [], []
+    for pid, games in hist.items():
+        for i, g in enumerate(games):
+            if g["season"] >= through_season:
+                continue
+            act = g.get(key)
+            if act is None:
+                continue
+            proj = project(games[:i], stat, pid)
+            if not proj or proj.mean < min_mean or proj.sd <= 0:
+                continue
+            errs.append(act - proj.mean)
+            zs.append((act - proj.mean) / proj.sd)
+    if len(errs) < 200:
+        return Calibration(stat=stat)
+    return Calibration(stat=stat, bias=float(np.mean(errs)),
+                       sd_scale=float(np.std(zs)), n=len(errs))
+
+
 def backtest(stat: str = "rec_yards", min_season: int = 2018,
-             lookback: int = 8, min_mean: float = 20.0) -> dict:
+             lookback: int = 8, min_mean: float = 20.0,
+             calibrate: bool = True) -> dict:
     """Walk forward through every player-week and score the projections.
 
     Two things are measured, and the second matters more:
@@ -229,6 +310,16 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
     errs, z_scores, preds, actuals = [], [], [], []
     over_at_mean = []
 
+    # One calibration per test season, fitted only on earlier ones.
+    seasons = sorted({g["season"] for gs in hist.values() for g in gs})
+    calibs: dict[int, Calibration] = {}
+    if calibrate:
+        for s in seasons:
+            if s <= min_season:
+                continue
+            calibs[s] = fit_calibration(stat, hist, through_season=s,
+                                        min_mean=min_mean)
+
     for pid, games in hist.items():
         for i in range(len(games)):
             g = games[i]
@@ -238,6 +329,11 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
             proj = project(games[:i], stat, pid)      # STRICTLY prior games
             if not proj or proj.mean < min_mean or proj.sd <= 0:
                 continue
+            cal = calibs.get(g["season"])
+            if cal is not None:
+                proj = cal.apply(proj)
+                if proj.sd <= 0:
+                    continue
             errs.append(act - proj.mean)
             z_scores.append((act - proj.mean) / proj.sd)
             preds.append(proj.mean)
@@ -263,6 +359,9 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
         "within_2sd": round(within_2sd, 3),
         "over_rate_at_own_line": round(float(np.mean(over_at_mean)), 3),
         "z_sd": round(float(np.std(z)), 3),
+        "calibrations": {s: {"bias": round(c.bias, 2),
+                             "sd_scale": round(c.sd_scale, 3), "n": c.n}
+                         for s, c in sorted(calibs.items())} if calibrate else {},
     }
 
 
@@ -275,12 +374,14 @@ if __name__ == "__main__":
     p.add_argument("--stat", default="rec_yards")
     p.add_argument("--player", default="")
     p.add_argument("--min-season", type=int, default=2018)
+    p.add_argument("--raw", action="store_true", help="skip calibration")
     args = p.parse_args()
 
     if args.command == "backtest":
         for stat in (["rec_yards", "rush_yards", "receptions"]
                      if args.stat == "all" else [args.stat]):
-            r = backtest(stat, min_season=args.min_season)
+            r = backtest(stat, min_season=args.min_season,
+                         calibrate=not args.raw)
             if "error" in r:
                 print(f"  {stat}: {r['error']}")
                 continue
@@ -293,6 +394,11 @@ if __name__ == "__main__":
             print(f"  z sd                 {r['z_sd']}   (want ~1.0; "
                   f"{'overconfident' if r['z_sd'] > 1.1 else 'underconfident' if r['z_sd'] < 0.9 else 'calibrated'})")
             print(f"  over rate at own line {r['over_rate_at_own_line']}   (want ~0.50)")
+            if r.get("calibrations"):
+                print("  calibration fitted per season (from EARLIER seasons only):")
+                for s, c in list(r["calibrations"].items())[-4:]:
+                    print(f"    {s}: bias {c['bias']:+6.2f}  sd x{c['sd_scale']:.3f}  "
+                          f"(n={c['n']:,})")
     elif args.command == "player":
         hist = build_player_history(args.min_season)
         games = hist.get(args.player)
