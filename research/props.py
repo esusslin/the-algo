@@ -49,6 +49,14 @@ K_YPC = 16.0          # yards per carry: slower still
 
 MIN_GAMES = 3
 
+# Tunable levers of the participation model. Fitted on training seasons only —
+# see `tune()`. Anything adjusted by looking at held-out results is no longer a
+# held-out result.
+BUST_CUT_FRAC = 0.35      # volume below this fraction of a player's median = bust
+BUST_PRIOR = 0.12         # league base rate, shrunk toward early in a season
+BUST_SHRINK_K = 6.0       # games before a player's own bust rate outweighs the prior
+BUST_SD_FRAC = 0.90       # spread of the bust component, as a fraction of its mean
+
 # Minimum projection worth evaluating, PER STAT. Using a single yardage-scale
 # threshold silently discarded every receptions projection (they run 4-6), which
 # is why that stat produced nothing at all.
@@ -118,7 +126,7 @@ class PropProjection:
         if self.p_bust <= 0:
             return normal_part
         bust_part = self._normal_cdf(x, max(self.bust_mean, 0.5),
-                                     max(self.bust_mean, 0.5) * 0.9)
+                                     max(self.bust_mean, 0.5) * BUST_SD_FRAC)
         return self.p_bust * bust_part + (1 - self.p_bust) * normal_part
 
     def prob_over(self, line: float) -> float:
@@ -262,15 +270,17 @@ def project(history: list[dict], stat: str, player_id: str,
     # below the player's own norm — injury, benching, game script. Fitting the
     # main distribution to these mixed together is what pushed excess mass into
     # the bottom decile.
-    typical = float(np.median([v for v in all_vols if v > 0]) or 0)
-    bust_cut = max(1.0, typical * 0.35)
+    positive = [v for v in all_vols if v > 0]
+    typical = float(np.median(positive)) if positive else 0.0
+    bust_cut = max(1.0, typical * BUST_CUT_FRAC)
     normal_vols = [v for v in all_vols if v >= bust_cut]
     bust_vols = [v for v in all_vols if v < bust_cut]
 
     p_bust = len(bust_vols) / len(all_vols) if all_vols else 0.0
     # Shrink toward a positional base rate: three quiet games early in a season
     # shouldn't imply a 40% bust probability.
-    p_bust = _shrink(p_bust, priors.get("bust_rate", 0.12), len(all_vols), 6.0)
+    p_bust = _shrink(p_bust, priors.get("bust_rate", BUST_PRIOR),
+                     len(all_vols), BUST_SHRINK_K)
 
     vols = normal_vols or all_vols
     vol_mean = float(np.mean(vols))
@@ -368,7 +378,8 @@ def fit_calibration(stat: str, hist: dict[str, list[dict]],
 
 def backtest(stat: str = "rec_yards", min_season: int = 2018,
              lookback: int = 8, min_mean: float = 20.0,
-             calibrate: bool = True) -> dict:
+             calibrate: bool = True,
+             only_seasons: set[int] | None = None) -> dict:
     """Walk forward through every player-week and score the projections.
 
     Two things are measured, and the second matters more:
@@ -402,6 +413,8 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
             g = games[i]
             act = g.get(actual_key)
             if act is None:
+                continue
+            if only_seasons is not None and g["season"] not in only_seasons:
                 continue
             proj = project(games[:i], stat, pid)      # STRICTLY prior games
             if not proj or proj.expected() < min_mean or proj.sd <= 0:
@@ -463,19 +476,128 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
     }
 
 
+HOLDOUT_FROM = 2024      # seasons >= this are NEVER used for tuning
+
+
+def tune(stat: str, hist: dict[str, list[dict]],
+         train_max_season: int = HOLDOUT_FROM - 1) -> dict:
+    """Grid-search the participation levers on TRAINING seasons only.
+
+    Scores by KS distance from uniform PIT — the direct measure of whether the
+    distribution is honest. Held-out seasons are excluded entirely; touching
+    them here would make the final evaluation meaningless.
+    """
+    global BUST_CUT_FRAC, BUST_PRIOR, BUST_SHRINK_K, BUST_SD_FRAC
+    train = {p: [g for g in gs if g["season"] <= train_max_season]
+             for p, gs in hist.items()}
+    train = {p: gs for p, gs in train.items() if len(gs) > MIN_GAMES}
+
+    best, best_ks = None, 1.0
+    grid = [(cut, prior, sdf)
+            for cut in (0.25, 0.35, 0.45, 0.55)
+            for prior in (0.08, 0.12, 0.18, 0.25)
+            for sdf in (0.6, 0.9, 1.2)]
+
+    saved = (BUST_CUT_FRAC, BUST_PRIOR, BUST_SHRINK_K, BUST_SD_FRAC)
+    for cut, prior, sdf in grid:
+        BUST_CUT_FRAC, BUST_PRIOR, BUST_SD_FRAC = cut, prior, sdf
+        r = _score_pit(stat, train)
+        if r and r["ks"] < best_ks:
+            best_ks, best = r["ks"], {"bust_cut_frac": cut, "bust_prior": prior,
+                                      "bust_sd_frac": sdf, "train_ks": round(r["ks"], 4)}
+    BUST_CUT_FRAC, BUST_PRIOR, BUST_SHRINK_K, BUST_SD_FRAC = saved
+    return best or {}
+
+
+def _score_pit(stat: str, hist: dict[str, list[dict]]) -> dict | None:
+    """PIT KS for a set of players, using calibration fitted within that set."""
+    key = {"rec_yards": "rec_yards", "rush_yards": "rush_yards",
+           "receptions": "receptions"}[stat]
+    min_mean = MIN_MEAN.get(stat, 20.0)
+    pit = []
+    for pid, games in hist.items():
+        for i, g in enumerate(games):
+            act = g.get(key)
+            if act is None:
+                continue
+            proj = project(games[:i], stat, pid)
+            if not proj or proj.expected() < min_mean or proj.sd <= 0:
+                continue
+            pit.append(proj.cdf(act))
+    if len(pit) < 500:
+        return None
+    srt = np.sort(np.array(pit))
+    n = len(srt)
+    return {"ks": float(np.max(np.abs(srt - np.arange(1, n + 1) / n))), "n": n}
+
+
+def holdout_evaluation(stat: str, min_season: int = 2018) -> dict:
+    """Tune on <=2023, then evaluate ONCE on 2024-2025.
+
+    Run this a single time per stat. Re-running after adjusting anything makes
+    the holdout a training set.
+    """
+    hist = build_player_history(min_season)
+    params = tune(stat, hist)
+    if not params:
+        return {"stat": stat, "error": "insufficient training data"}
+
+    global BUST_CUT_FRAC, BUST_PRIOR, BUST_SD_FRAC
+    saved = (BUST_CUT_FRAC, BUST_PRIOR, BUST_SD_FRAC)
+    BUST_CUT_FRAC = params["bust_cut_frac"]
+    BUST_PRIOR = params["bust_prior"]
+    BUST_SD_FRAC = params["bust_sd_frac"]
+
+    held = {p: gs for p, gs in hist.items()}
+    r = backtest(stat, min_season=min_season, calibrate=True,
+                 only_seasons=set(range(HOLDOUT_FROM, 2030)))
+    BUST_CUT_FRAC, BUST_PRIOR, BUST_SD_FRAC = saved
+    return {"stat": stat, "tuned_on": f"<= {HOLDOUT_FROM - 1}",
+            "params": params, "holdout": r}
+
+
 if __name__ == "__main__":
     import argparse
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(description="prop projections (local only)")
-    p.add_argument("command", choices=["backtest", "player", "demo"])
+    p.add_argument("command", choices=["backtest", "player", "demo", "holdout"])
     p.add_argument("--stat", default="rec_yards")
     p.add_argument("--player", default="")
     p.add_argument("--min-season", type=int, default=2018)
     p.add_argument("--raw", action="store_true", help="skip calibration")
     args = p.parse_args()
 
-    if args.command == "backtest":
+    if args.command == "holdout":
+        print("Tuning on seasons <= 2023, then evaluating ONCE on 2024-2025.")
+        print("Do not re-run after changing anything — that turns the holdout")
+        print("into a training set.\n")
+        for stat in (["rec_yards", "rush_yards", "receptions"]
+                     if args.stat == "all" else [args.stat]):
+            res = holdout_evaluation(stat, min_season=args.min_season)
+            if "error" in res:
+                print(f"  {stat}: {res['error']}")
+                continue
+            pr, r = res["params"], res["holdout"]
+            print(f"=== {stat} ===")
+            print(f"  tuned on {res['tuned_on']}: bust_cut={pr['bust_cut_frac']} "
+                  f"prior={pr['bust_prior']} sd_frac={pr['bust_sd_frac']} "
+                  f"(train KS {pr['train_ks']})")
+            if "error" in r:
+                print(f"  holdout: {r['error']}\n")
+                continue
+            print(f"  HELD-OUT 2024-25 — {r['n']:,} projections")
+            print(f"    deciles  {' '.join(f'{d:.3f}' for d in r['pit_deciles'])}")
+            print(f"    KS       {r['pit_ks']}   (want < 0.03)")
+            print(f"    bias     {r['bias']:+}    over rate {r['over_rate_at_own_line']}")
+            gap = r["pit_ks"] - pr["train_ks"]
+            print(f"    train->holdout KS drift: {gap:+.4f}  "
+                  f"({'overfit' if gap > 0.02 else 'generalises'})")
+            verdict = ("READY to price" if r["pit_ks"] < 0.03 else
+                       "usable with caution" if r["pit_ks"] < 0.05 else
+                       "NOT READY — do not price this market")
+            print(f"    -> {verdict}\n")
+    elif args.command == "backtest":
         for stat in (["rec_yards", "rush_yards", "receptions"]
                      if args.stat == "all" else [args.stat]):
             r = backtest(stat, min_season=args.min_season,
