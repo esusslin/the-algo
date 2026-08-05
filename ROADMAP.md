@@ -154,9 +154,36 @@ research plane starts by Aug 11.
 
 ## P2 — after launch
 
-- [ ] **Player props** (`ENABLE_PROPS`) — Week 4–6. Needs distributional models
-      (`P(X > line)`, not `E[X]`), volume-first modelling, consistency
-      reconciliation, and the $59 credit plan.
+- [ ] **Player props** (`ENABLE_PROPS`) — Week 4–6, and now with a specific
+      blocker identified.
+
+      **Status (Aug 2026):** the distributional engine is built — volume ×
+      efficiency, lognormal with a participation mixture, walk-forward
+      calibration. It was evaluated on a clean holdout (tuned ≤2023, tested
+      once on 2024-25) and **fails**:
+
+      | stat | holdout KS | train→holdout drift |
+      |---|---|---|
+      | receptions | 0.058 | −0.002 (generalises) |
+      | rush_yards | 0.073 | +0.025 (overfit) |
+      | rec_yards | 0.101 | +0.024 (overfit) |
+
+      Target is KS < 0.03. At 0.06–0.10 the probabilities are off by more than
+      the edge being hunted, so a mispricing cannot be distinguished from model
+      error. Do not price props on this.
+
+      **The diagnosed cause:** bust probability is modelled as a player's
+      historical rate, but it isn't a player constant — it depends on *this
+      game*. Injury-report status, snap-share trend, whether the team is a big
+      favourite likely to rest him, the game total. Every decile table shows
+      the same signature: too much mass in the bottom 10%, meaning quiet games
+      are underpredicted and every `P(over)` runs high.
+
+      **What unblocks it:** `p_bust` becomes a model with game-level inputs
+      rather than a historical average. The inputs are the injury feed, snap
+      counts and market-implied game script — all of which only started
+      collecting in Aug 2026. Several weeks of in-season data makes this
+      buildable; it is not buildable now.
 - [ ] **Monte Carlo simulator** (`ENABLE_SIMULATOR`) — Week ~8. Unlocks alt
       lines, key numbers at 3 and 7, 1H/2H, team totals, and SGP correlation.
       Also fixes sharp-anchor coverage when Pinnacle quotes a different number.
