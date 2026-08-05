@@ -194,15 +194,18 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     if verdict not in VERDICTS:
         verdict = "OK"
 
-    # An unevidenced KILL is an opinion, not a finding. Demote it.
+    # An unevidenced KILL is an opinion, not a finding. Demote it once — and
+    # skip the grounding check below, which would otherwise demote it a second
+    # time straight to OK for the same reason.
+    unevidenced = False
     if verdict == "KILL" and len(evidence.strip()) < 12:
         log.info("demoting unevidenced KILL to FLAG: %s", reason[:80])
-        verdict, reason = "FLAG", f"(unevidenced) {reason}"
+        verdict, reason, unevidenced = "FLAG", f"(unevidenced) {reason}", True
 
     # Evidence must quote something actually in the context. Models will
     # otherwise cite the ABSENCE of data — "no injury report available" — as
     # grounds to object, which would gut a slate whenever ingestion is behind.
-    if verdict in ("KILL", "FLAG"):
+    if verdict in ("KILL", "FLAG") and not unevidenced:
         blob = (str(ctx.get("injuries")) + str(ctx.get("inactives"))
                 + str(ctx.get("weather")) + str(ctx.get("recent_line_moves"))
                 + str(ctx.get("week")) + str(ctx.get("season_type"))

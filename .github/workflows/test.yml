@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install serving dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        env:
+          DATABASE_PATH: /tmp/ci.db
+          DATA_DIR: /tmp/ci
+          ODDS_API_KEY: test
+          JWT_SECRET_KEY: test
+        run: pytest tests/ -q
+
+      # Railway deploys on push regardless of CI, so this is a signal rather
+      # than a gate. If you want it to block, enable "Wait for CI" in the
+      # Railway service settings.
+      - name: Grading self-test
+        env:
+          DATABASE_PATH: /tmp/ci2.db
+          DATA_DIR: /tmp/ci
+          ODDS_API_KEY: test
+          JWT_SECRET_KEY: test
+        run: python -m src.picks.grading selftest

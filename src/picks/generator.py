@@ -67,8 +67,16 @@ def thresholds_for(market_type: str, tier: str) -> dict:
     }
 
 
+# Above this, the books disagree so violently that the "edge" is almost
+# certainly a data problem — a stale quote, a mislabelled line, a bad parse.
+# No tier should accept it, however large the apparent edge.
+MAX_CREDIBLE_DISPERSION = 0.15
+
+
 def assign_tier(opp: dict) -> str | None:
     """A/B/C, or None if it doesn't clear the bar for its market class."""
+    if (opp.get("dispersion") or 0) > MAX_CREDIBLE_DISPERSION:
+        return None
     for tier in ("A", "B", "C"):
         r = thresholds_for(opp["market_type"], tier)
         if opp["edge_pct"] < r["min_edge"]:
