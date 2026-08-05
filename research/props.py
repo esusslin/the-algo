@@ -77,6 +77,16 @@ class PropProjection:
     p_bust: float = 0.0
     bust_mean: float = 0.0
 
+    def expected(self) -> float:
+        """Unconditional expectation across BOTH components.
+
+        `mean` is the non-bust component only. Comparing an actual outcome
+        against `mean` double-counts the bust adjustment — the mixture already
+        places mass near zero — which is what drove the bias correction to an
+        absurd -6.3 yards. Anything measuring error must use this.
+        """
+        return self.p_bust * self.bust_mean + (1 - self.p_bust) * self.mean
+
     def _lognormal_params(self) -> tuple[float, float]:
         var = self.sd ** 2
         mu = math.log(self.mean ** 2 / math.sqrt(var + self.mean ** 2))
@@ -282,7 +292,9 @@ def project(history: list[dict], stat: str, player_id: str,
     var = (vol_sd**2 * eff_sd**2) + (vol_sd**2 * eff_mean**2) + (eff_sd**2 * vol_mean**2)
     sd = float(np.sqrt(max(var, 1e-9)))
 
-    bust_mean = float(np.mean(bust_vols)) * eff_mean if bust_vols else mean * 0.15
+    # np.mean on an empty list warns and returns nan — guard explicitly.
+    bust_mean = (float(np.mean(bust_vols)) * eff_mean
+                 if len(bust_vols) > 0 else mean * 0.15)
     return PropProjection(
         player_id=player_id, stat=stat,
         volume_mean=round(vol_mean, 2), volume_sd=round(vol_sd, 2),
@@ -344,10 +356,10 @@ def fit_calibration(stat: str, hist: dict[str, list[dict]],
             if act is None:
                 continue
             proj = project(games[:i], stat, pid)
-            if not proj or proj.mean < min_mean or proj.sd <= 0:
+            if not proj or proj.expected() < min_mean or proj.sd <= 0:
                 continue
-            errs.append(act - proj.mean)
-            zs.append((act - proj.mean) / proj.sd)
+            errs.append(act - proj.expected())
+            zs.append((act - proj.expected()) / proj.sd)
     if len(errs) < 200:
         return Calibration(stat=stat)
     return Calibration(stat=stat, bias=float(np.mean(errs)),
@@ -392,16 +404,17 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
             if act is None:
                 continue
             proj = project(games[:i], stat, pid)      # STRICTLY prior games
-            if not proj or proj.mean < min_mean or proj.sd <= 0:
+            if not proj or proj.expected() < min_mean or proj.sd <= 0:
                 continue
             cal = calibs.get(g["season"])
             if cal is not None:
                 proj = cal.apply(proj)
                 if proj.sd <= 0:
                     continue
-            errs.append(act - proj.mean)
-            z_scores.append((act - proj.mean) / proj.sd)
-            preds.append(proj.mean)
+            exp = proj.expected()
+            errs.append(act - exp)
+            z_scores.append((act - exp) / proj.sd)
+            preds.append(exp)
             actuals.append(act)
             pit_vals.append(proj.cdf(act))
             # if the projection is honest, the actual should beat its own
