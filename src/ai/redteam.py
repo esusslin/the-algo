@@ -310,7 +310,8 @@ def apply_to_picks(limit: int = 60) -> dict:
     return {"reviewed": out["reviewed"], "games": out["games"],
             "counts": out["counts"], "changed": changed,
             "ai_ran": out["ai_ran"], "reviewed_by_model": out["reviewed_by_model"],
-            "sources": out["sources"], "errors": out.get("errors", [])}
+            "sources": out["sources"], "errors": out.get("errors", []),
+            "results": out["results"]}
 
 
 if __name__ == "__main__":

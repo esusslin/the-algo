@@ -147,7 +147,7 @@ def seed_pending(count: int = 14) -> int:
     """
     run_migrations()
     games = [dict(r) for r in query(
-        "SELECT game_id, home_team, away_team FROM games "
+        "SELECT game_id, home_team, away_team, spread_line, total_line FROM games "
         "WHERE status!='final' ORDER BY kickoff_utc LIMIT 20"
     )]
 
@@ -168,21 +168,47 @@ def seed_pending(count: int = 14) -> int:
                 games.append({"game_id": gid, "home_team": home, "away_team": away})
         print(f"  (no real schedule loaded — invented {len(games)} demo fixtures)")
 
-    # Resolve demo player names against the real crosswalk so prop cards read
-    # "Cooper Kupp over 58.5" rather than "Player over 58.5". Never invents
-    # player rows — a fake gsis_id would corrupt real name resolution later.
-    def pid_for(name: str | None) -> str:
-        if not name:
-            return ""
-        r = query("SELECT player_id FROM players WHERE LOWER(full_name)=? LIMIT 1",
-                  (name.lower(),))
-        return r[0]["player_id"] if r else ""
+    # Props must belong to a player actually on one of the two teams playing.
+    # The first version picked a random hardcoded name and attached it to a
+    # random game — the red-team agent caught it immediately ("Saquon Barkley
+    # plays for Philadelphia, not TB or CIN"), which is a good argument for
+    # having a red team.
+    POS_FOR_STAT = {
+        "player_pass_yds": ("QB",), "player_pass_tds": ("QB",),
+        "player_pass_completions": ("QB",), "player_pass_attempts": ("QB",),
+        "player_pass_interceptions": ("QB",),
+        "player_rush_yds": ("RB",), "player_rush_attempts": ("RB",),
+        "player_reception_yds": ("WR", "TE"), "player_receptions": ("WR", "TE"),
+        "player_anytime_td": ("RB", "WR", "TE"),
+    }
+
+    def player_in_game(market: str, home: str, away: str) -> tuple[str, str] | None:
+        positions = POS_FOR_STAT.get(market, ("WR", "RB", "TE", "QB"))
+        rows = query(
+            "SELECT player_id, full_name FROM players WHERE team IN (?,?) "
+            f"AND position IN ({','.join('?' * len(positions))}) "
+            "AND full_name IS NOT NULL ORDER BY RANDOM() LIMIT 1",
+            (home, away, *positions))
+        return (rows[0]["player_id"], rows[0]["full_name"]) if rows else None
 
     made = 0
     with db() as conn:
         for i in range(count):
             g = random.choice(games)
             mkt, side, line, player = random.choice(MARKETS)
+            pid = ""
+            if mkt.startswith("player_"):
+                found = player_in_game(mkt, g["home_team"], g["away_team"])
+                if not found:
+                    continue          # no suitable player on either roster
+                pid, player = found
+            # Keep demo lines near the game's real market so they don't read as
+            # stale pricing — the red team flags that too, and correctly.
+            if mkt == "totals" and g.get("total_line"):
+                line = round(float(g["total_line"]) * 2) / 2
+            elif mkt.startswith("spreads") and g.get("spread_line") is not None:
+                line = -round(float(g["spread_line"]) * 2) / 2 if side == "home" \
+                    else round(float(g["spread_line"]) * 2) / 2
             # spread the tiers so testers see all three states
             tier = ["A", "A", "B", "B", "B", "C", "C", "C", "C"][i % 9]
             edge = {"A": random.uniform(5.0, 7.5), "B": random.uniform(3.0, 4.9),
@@ -192,7 +218,7 @@ def seed_pending(count: int = 14) -> int:
             price = _price()
             insert_row(conn, "picks", {
                 "game_id": g["game_id"], "market_type": mkt,
-                "player_id": pid_for(player),
+                "player_id": pid,
                 "side": side, "line": line, "source": "market_engine",
                 "best_book": random.choice(BOOKS), "best_price": price,
                 "fair_prob": 0.54, "blended_prob": 0.54,

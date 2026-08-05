@@ -630,11 +630,15 @@ def ai_usage(admin: dict = Depends(auth.current_admin)) -> dict:
 def run_redteam(admin: dict = Depends(auth.current_admin)) -> dict:
     from src.ai.redteam import apply_to_picks
     out = apply_to_picks()
-    # return the actual verdicts so a high downgrade rate can be diagnosed
+    # Only verdicts from THIS run. Querying every FLAG/KILL in the table showed
+    # stale results next to a fresh summary — "0 killed" above a list of kills.
+    ids = [pid for pid, r in (out.get("results") or {}).items()
+           if r.get("verdict") in ("FLAG", "KILL")]
     out["verdicts"] = [dict(r) for r in query(
         "SELECT pick_id, tier, published, ai_verdict, ai_reason, headline "
-        "FROM picks WHERE ai_verdict IN ('FLAG','KILL') "
-        "ORDER BY pick_id DESC LIMIT 20")]
+        f"FROM picks WHERE pick_id IN ({','.join('?' * len(ids))}) "
+        "ORDER BY pick_id DESC", ids)] if ids else []
+    out.pop("results", None)      # not useful over the wire
     return out
 
 
