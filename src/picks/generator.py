@@ -117,6 +117,17 @@ def blended_probability(opp: dict) -> dict:
     }
     prob, source = market_prob, "market"
 
+    # Blend weight comes from the active artifact bundle, defaulting to 0 when
+    # none is loaded — so a missing or unhealthy bundle degrades to market-only
+    # pricing rather than failing.
+    if "blend_weight" not in opp:
+        try:
+            from src.models.artifacts import active_bundle
+            b = active_bundle()
+            opp = {**opp, "blend_weight": b.weight_for(opp["market_type"]) if b else 0.0}
+        except Exception:  # noqa: BLE001
+            opp = {**opp, "blend_weight": 0.0}
+
     model_prob = opp.get("model_prob")
     if model_prob is not None and settings.PUBLISH_MODEL_PICKS:
         # Blend in log-odds space, weight per market class. w stays small for
