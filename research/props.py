@@ -49,6 +49,12 @@ K_YPC = 16.0          # yards per carry: slower still
 
 MIN_GAMES = 3
 
+# Minimum projection worth evaluating, PER STAT. Using a single yardage-scale
+# threshold silently discarded every receptions projection (they run 4-6), which
+# is why that stat produced nothing at all.
+MIN_MEAN = {"rec_yards": 20.0, "rush_yards": 20.0, "receptions": 2.0,
+            "pass_yards": 150.0}
+
 
 @dataclass
 class PropProjection:
@@ -63,6 +69,22 @@ class PropProjection:
     n_games: int
     confident: bool
 
+    def _lognormal_params(self) -> tuple[float, float]:
+        var = self.sd ** 2
+        mu = math.log(self.mean ** 2 / math.sqrt(var + self.mean ** 2))
+        sigma = math.sqrt(math.log(1 + var / self.mean ** 2))
+        return mu, sigma
+
+    def cdf(self, x: float) -> float:
+        """P(X <= x). The distribution itself, which is what prices a prop."""
+        if self.sd <= 0 or self.mean <= 0:
+            return 0.5
+        if x <= 0:
+            return 0.0
+        mu, sigma = self._lognormal_params()
+        z = (math.log(x) - mu) / sigma
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+
     def prob_over(self, line: float) -> float:
         """P(X > line).
 
@@ -74,11 +96,7 @@ class PropProjection:
             return 0.5
         if line <= 0:
             return 1.0
-        var = self.sd ** 2
-        mu = math.log(self.mean ** 2 / math.sqrt(var + self.mean ** 2))
-        sigma = math.sqrt(math.log(1 + var / self.mean ** 2))
-        z = (math.log(line) - mu) / sigma
-        return 1.0 - 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+        return 1.0 - self.cdf(line)
 
     def fair_line(self, prob: float = 0.5) -> float:
         """The line at which this projection is a coin flip — comparable
@@ -307,8 +325,9 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
     actual_key = {"rec_yards": "rec_yards", "rush_yards": "rush_yards",
                   "receptions": "receptions"}[stat]
 
+    min_mean = MIN_MEAN.get(stat, min_mean)
     errs, z_scores, preds, actuals = [], [], [], []
-    over_at_mean = []
+    over_at_mean, pit_vals = [], []
 
     # One calibration per test season, fitted only on earlier ones.
     seasons = sorted({g["season"] for gs in hist.values() for g in gs})
@@ -338,6 +357,7 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
             z_scores.append((act - proj.mean) / proj.sd)
             preds.append(proj.mean)
             actuals.append(act)
+            pit_vals.append(proj.cdf(act))
             # if the projection is honest, the actual should beat its own
             # median line about half the time
             over_at_mean.append(1 if act > proj.fair_line(0.5) else 0)
@@ -349,12 +369,31 @@ def backtest(stat: str = "rec_yards", min_season: int = 2018,
     within_1sd = float(np.mean(np.abs(z) <= 1.0))
     within_2sd = float(np.mean(np.abs(z) <= 2.0))
 
+    # PIT — the correct test for a distributional forecast.
+    #
+    # Feed each actual outcome through its own predicted CDF. If the
+    # distributions are honest, those values are uniform on [0,1]: 10% of
+    # outcomes land below the 10th percentile, and so on. The z-score test
+    # assumes normality and therefore measures the wrong thing on a skewed
+    # distribution — which is why within_1sd and z_sd disagreed.
+    pit = np.array(pit_vals)
+    deciles = [float(np.mean((pit >= i / 10) & (pit < (i + 1) / 10)))
+               for i in range(10)]
+    # Kolmogorov-Smirnov distance from uniform: one number for "how wrong"
+    srt = np.sort(pit)
+    n_pit = len(srt)
+    ks = float(np.max(np.abs(srt - np.arange(1, n_pit + 1) / n_pit))) if n_pit else 1.0
+
     return {
         "stat": stat, "n": len(errs),
         "mae": round(float(np.mean(np.abs(errs))), 2),
         "bias": round(float(np.mean(errs)), 2),
         "corr": round(float(np.corrcoef(preds, actuals)[0, 1]), 3),
-        # calibration of the DISTRIBUTION, which is what prices a prop
+        # distributional calibration — what actually prices a prop
+        "pit_deciles": [round(d, 3) for d in deciles],
+        "pit_ks": round(ks, 4),
+        "pit_mean": round(float(np.mean(pit)), 3),
+        # normal-approximation diagnostics, kept for comparison
         "within_1sd": round(within_1sd, 3),
         "within_2sd": round(within_2sd, 3),
         "over_rate_at_own_line": round(float(np.mean(over_at_mean)), 3),
@@ -389,11 +428,22 @@ if __name__ == "__main__":
             print(f"  MAE                  {r['mae']}")
             print(f"  bias                 {r['bias']:+}  (want ~0)")
             print(f"  corr(pred, actual)   {r['corr']}")
-            print(f"  within 1 sd          {r['within_1sd']}   (want ~0.68)")
-            print(f"  within 2 sd          {r['within_2sd']}   (want ~0.95)")
-            print(f"  z sd                 {r['z_sd']}   (want ~1.0; "
-                  f"{'overconfident' if r['z_sd'] > 1.1 else 'underconfident' if r['z_sd'] < 0.9 else 'calibrated'})")
             print(f"  over rate at own line {r['over_rate_at_own_line']}   (want ~0.50)")
+
+            print("\n  DISTRIBUTIONAL CALIBRATION (what prices a prop)")
+            print(f"  PIT deciles: each should be ~0.100")
+            bars = "".join(f"{d:>6.3f}" for d in r["pit_deciles"])
+            print(f"   {bars}")
+            worst = max(abs(d - 0.1) for d in r["pit_deciles"])
+            print(f"  max decile error     {worst:.3f}   (want < 0.02)")
+            print(f"  KS distance          {r['pit_ks']}   (want < 0.03)")
+            print(f"  PIT mean             {r['pit_mean']}   (want ~0.50)")
+            verdict = ("well calibrated" if r["pit_ks"] < 0.03 else
+                       "usable, some skew" if r["pit_ks"] < 0.06 else
+                       "MISCALIBRATED — probabilities not trustworthy")
+            print(f"  -> {verdict}")
+            print(f"\n  (normal-approx diagnostics, for reference: within1sd "
+                  f"{r['within_1sd']}, z_sd {r['z_sd']})")
             if r.get("calibrations"):
                 print("  calibration fitted per season (from EARLIER seasons only):")
                 for s, c in list(r["calibrations"].items())[-4:]:
