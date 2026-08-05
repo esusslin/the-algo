@@ -1,0 +1,314 @@
+"""Player prop projections — distributional, volume-first.
+
+Why this is structured differently from the game models
+-------------------------------------------------------
+A prop is a threshold bet: you need P(X > line), not E[X]. Two receivers with
+the same projected 62 yards and different variance carry genuinely different
+fair prices, and a point estimate cannot express that.
+
+So every projection here outputs a DISTRIBUTION, assembled as:
+
+    yards = volume × efficiency
+
+modelled separately because they behave completely differently:
+
+* **Volume is predictable.** Target share and carry share are among the most
+  stable quantities in football — role changes slowly, and usage is a coaching
+  decision rather than a coin flip.
+* **Efficiency is noisy.** Yards per target swings wildly game to game. The
+  honest move is to estimate its *distribution* from a player's history and
+  the matchup, not to predict its value.
+
+Getting this order right matters more than any single feature. A model that
+predicts volume well and treats efficiency as a distribution beats one that
+predicts total yards directly, because it separates the part you can know from
+the part you can't.
+
+LOCAL ONLY — never imported by server.py.
+"""
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+from research.warehouse import connect
+
+log = logging.getLogger(__name__)
+
+# Usage stabilises fast; efficiency barely does. These shrinkage constants say
+# how many games before a player's own rate outweighs the positional prior —
+# fitted values should replace these guesses once there's walk-forward evidence.
+K_TARGET_SHARE = 4.0
+K_CARRY_SHARE = 4.0
+K_YPT = 12.0          # yards per target: slow, noisy
+K_YPC = 16.0          # yards per carry: slower still
+
+MIN_GAMES = 3
+
+
+@dataclass
+class PropProjection:
+    player_id: str
+    stat: str
+    volume_mean: float
+    volume_sd: float
+    eff_mean: float
+    eff_sd: float
+    mean: float
+    sd: float
+    n_games: int
+    confident: bool
+
+    def prob_over(self, line: float) -> float:
+        """P(X > line).
+
+        Yardage is right-skewed — a receiver's floor is zero but the ceiling is
+        open — so a lognormal fit beats a normal one, particularly in the tails
+        where props are actually priced.
+        """
+        if self.sd <= 0 or self.mean <= 0:
+            return 0.5
+        if line <= 0:
+            return 1.0
+        var = self.sd ** 2
+        mu = math.log(self.mean ** 2 / math.sqrt(var + self.mean ** 2))
+        sigma = math.sqrt(math.log(1 + var / self.mean ** 2))
+        z = (math.log(line) - mu) / sigma
+        return 1.0 - 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+
+    def fair_line(self, prob: float = 0.5) -> float:
+        """The line at which this projection is a coin flip — comparable
+        directly against what a book has posted."""
+        lo, hi = 0.0, max(self.mean * 5, 10.0)
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if self.prob_over(mid) > prob:
+                lo = mid
+            else:
+                hi = mid
+        return round((lo + hi) / 2, 1)
+
+
+def _shrink(observed: float, prior: float, n: int, k: float) -> float:
+    """Blend a player's own rate toward the positional prior by sample size.
+
+    Early in a season a three-game target share is mostly noise; this is what
+    stops a receiver with two big games being projected as a WR1.
+    """
+    return (n * observed + k * prior) / (n + k) if (n + k) > 0 else prior
+
+
+def build_player_history(min_season: int = 2016) -> dict[str, Any]:
+    """Per-player, per-week usage and efficiency, ordered in time.
+
+    Point-in-time by construction: every row carries only what happened in that
+    game, and projections consume strictly earlier rows.
+    """
+    con = connect(read_only=True)
+    rows = con.execute("""
+        SELECT pw.season, pw.week, pw.game_id, pw.team, pw.player_id,
+               pw.targets, pw.carries, pw.air_yards,
+               pw.target_share, pw.carry_share,
+               pw.epa_per_target, pw.epa_per_carry
+        FROM player_weeks pw
+        WHERE pw.season >= ? AND pw.player_id IS NOT NULL
+        ORDER BY pw.player_id, pw.season, pw.week
+    """, [min_season]).fetchall()
+
+    # actual yardage outcomes, for training the efficiency distribution
+    try:
+        stats = con.execute("""
+            SELECT player_id, season, week,
+                   receiving_yards, receptions, rushing_yards, carries AS rush_att,
+                   passing_yards
+            FROM stats_player
+            WHERE season >= ?
+        """, [min_season]).fetchall()
+        stat_idx = {(r[0], r[1], r[2]): r for r in stats}
+    except Exception as exc:  # noqa: BLE001 — column names vary across releases
+        log.warning("stats_player unavailable or reshaped (%s) — efficiency will "
+                    "come from EPA proxies only", exc)
+        stat_idx = {}
+    con.close()
+
+    by_player: dict[str, list[dict]] = {}
+    for r in rows:
+        s = stat_idx.get((r[4], r[0], r[1]))
+        by_player.setdefault(r[4], []).append({
+            "season": r[0], "week": r[1], "game_id": r[2], "team": r[3],
+            "targets": r[5] or 0, "carries": r[6] or 0, "air_yards": r[7] or 0,
+            "target_share": r[8], "carry_share": r[9],
+            "rec_yards": (s[3] if s else None),
+            "receptions": (s[4] if s else None),
+            "rush_yards": (s[5] if s else None),
+        })
+    log.info("player history: %d players, %d player-weeks",
+             len(by_player), sum(len(v) for v in by_player.values()))
+    return by_player
+
+
+def project(history: list[dict], stat: str, player_id: str,
+            priors: dict[str, float] | None = None) -> PropProjection | None:
+    """Project one stat from a player's PRIOR games only.
+
+    `history` must already be truncated to games before the one being projected —
+    the caller owns that cut, so this function cannot leak future data.
+    """
+    priors = priors or {}
+    n = len(history)
+    if n < MIN_GAMES:
+        return None
+
+    if stat == "rec_yards":
+        vols = [h["targets"] for h in history]
+        effs = [(h["rec_yards"] / h["targets"])
+                for h in history if h["targets"] and h["rec_yards"] is not None]
+        k_eff, prior_eff = K_YPT, priors.get("ypt", 7.8)
+    elif stat == "rush_yards":
+        vols = [h["carries"] for h in history]
+        effs = [(h["rush_yards"] / h["carries"])
+                for h in history if h["carries"] and h["rush_yards"] is not None]
+        k_eff, prior_eff = K_YPC, priors.get("ypc", 4.3)
+    elif stat == "receptions":
+        vols = [h["targets"] for h in history]
+        effs = [(h["receptions"] / h["targets"])
+                for h in history if h["targets"] and h["receptions"] is not None]
+        k_eff, prior_eff = 10.0, priors.get("catch_rate", 0.65)
+    else:
+        return None
+
+    if not vols:
+        return None
+
+    vol_mean = float(np.mean(vols))
+    vol_sd = float(np.std(vols, ddof=1)) if len(vols) > 1 else vol_mean * 0.5
+
+    if effs:
+        eff_raw = float(np.mean(effs))
+        eff_sd = float(np.std(effs, ddof=1)) if len(effs) > 1 else eff_raw * 0.4
+        eff_mean = _shrink(eff_raw, prior_eff, len(effs), k_eff)
+    else:
+        eff_mean, eff_sd = prior_eff, prior_eff * 0.45
+
+    mean = vol_mean * eff_mean
+    # Volume and efficiency are near-independent, so variance compounds:
+    #   Var(XY) = Var(X)Var(Y) + Var(X)E[Y]^2 + Var(Y)E[X]^2
+    # Ignoring this and using only volume variance understates spread badly,
+    # which is exactly the error that misprices the tails of a prop ladder.
+    var = (vol_sd**2 * eff_sd**2) + (vol_sd**2 * eff_mean**2) + (eff_sd**2 * vol_mean**2)
+    sd = float(np.sqrt(max(var, 1e-9)))
+
+    return PropProjection(
+        player_id=player_id, stat=stat,
+        volume_mean=round(vol_mean, 2), volume_sd=round(vol_sd, 2),
+        eff_mean=round(eff_mean, 3), eff_sd=round(eff_sd, 3),
+        mean=round(mean, 1), sd=round(sd, 1),
+        n_games=n, confident=n >= 6)
+
+
+def backtest(stat: str = "rec_yards", min_season: int = 2018,
+             lookback: int = 8, min_mean: float = 20.0) -> dict:
+    """Walk forward through every player-week and score the projections.
+
+    Two things are measured, and the second matters more:
+
+      accuracy    — is the centre right? (MAE, bias)
+      calibration — is the SPREAD right? A projection claiming 62 ± 25 should
+                    have the actual land inside one sd about 68% of the time.
+                    Get this wrong and every P(over) is wrong, however good the
+                    mean is.
+    """
+    hist = build_player_history(min_season)
+    actual_key = {"rec_yards": "rec_yards", "rush_yards": "rush_yards",
+                  "receptions": "receptions"}[stat]
+
+    errs, z_scores, preds, actuals = [], [], [], []
+    over_at_mean = []
+
+    for pid, games in hist.items():
+        for i in range(len(games)):
+            g = games[i]
+            act = g.get(actual_key)
+            if act is None:
+                continue
+            proj = project(games[:i], stat, pid)      # STRICTLY prior games
+            if not proj or proj.mean < min_mean or proj.sd <= 0:
+                continue
+            errs.append(act - proj.mean)
+            z_scores.append((act - proj.mean) / proj.sd)
+            preds.append(proj.mean)
+            actuals.append(act)
+            # if the projection is honest, the actual should beat its own
+            # median line about half the time
+            over_at_mean.append(1 if act > proj.fair_line(0.5) else 0)
+
+    if not errs:
+        return {"error": "no projections produced — check stats_player columns"}
+
+    errs = np.array(errs); z = np.array(z_scores)
+    within_1sd = float(np.mean(np.abs(z) <= 1.0))
+    within_2sd = float(np.mean(np.abs(z) <= 2.0))
+
+    return {
+        "stat": stat, "n": len(errs),
+        "mae": round(float(np.mean(np.abs(errs))), 2),
+        "bias": round(float(np.mean(errs)), 2),
+        "corr": round(float(np.corrcoef(preds, actuals)[0, 1]), 3),
+        # calibration of the DISTRIBUTION, which is what prices a prop
+        "within_1sd": round(within_1sd, 3),
+        "within_2sd": round(within_2sd, 3),
+        "over_rate_at_own_line": round(float(np.mean(over_at_mean)), 3),
+        "z_sd": round(float(np.std(z)), 3),
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser(description="prop projections (local only)")
+    p.add_argument("command", choices=["backtest", "player", "demo"])
+    p.add_argument("--stat", default="rec_yards")
+    p.add_argument("--player", default="")
+    p.add_argument("--min-season", type=int, default=2018)
+    args = p.parse_args()
+
+    if args.command == "backtest":
+        for stat in (["rec_yards", "rush_yards", "receptions"]
+                     if args.stat == "all" else [args.stat]):
+            r = backtest(stat, min_season=args.min_season)
+            if "error" in r:
+                print(f"  {stat}: {r['error']}")
+                continue
+            print(f"\n=== {stat} — {r['n']:,} projections ===")
+            print(f"  MAE                  {r['mae']}")
+            print(f"  bias                 {r['bias']:+}  (want ~0)")
+            print(f"  corr(pred, actual)   {r['corr']}")
+            print(f"  within 1 sd          {r['within_1sd']}   (want ~0.68)")
+            print(f"  within 2 sd          {r['within_2sd']}   (want ~0.95)")
+            print(f"  z sd                 {r['z_sd']}   (want ~1.0; "
+                  f"{'overconfident' if r['z_sd'] > 1.1 else 'underconfident' if r['z_sd'] < 0.9 else 'calibrated'})")
+            print(f"  over rate at own line {r['over_rate_at_own_line']}   (want ~0.50)")
+    elif args.command == "player":
+        hist = build_player_history(args.min_season)
+        games = hist.get(args.player)
+        if not games:
+            raise SystemExit(f"no history for {args.player}")
+        proj = project(games[:-1], args.stat, args.player)
+        print(f"  {args.player} — {args.stat} from {len(games)-1} prior games")
+        print(f"  volume  {proj.volume_mean} ± {proj.volume_sd}")
+        print(f"  eff     {proj.eff_mean} ± {proj.eff_sd}")
+        print(f"  proj    {proj.mean} ± {proj.sd}")
+        print(f"  median line {proj.fair_line(0.5)}")
+        for ln in [proj.mean * 0.8, proj.mean, proj.mean * 1.2]:
+            print(f"    P(over {ln:.1f}) = {proj.prob_over(ln):.3f}")
+    else:
+        pr = PropProjection("demo", "rec_yards", 7.0, 2.5, 8.5, 3.0, 59.5, 28.0, 10, True)
+        print(f"  projection {pr.mean} ± {pr.sd}")
+        print(f"  fair (median) line: {pr.fair_line(0.5)}")
+        for ln in (45.5, 52.5, 59.5, 66.5, 75.5):
+            print(f"    P(over {ln}) = {pr.prob_over(ln):.3f}")

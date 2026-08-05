@@ -47,11 +47,22 @@ Return ONLY a JSON object:
 specific fact from the context that supports this, or empty string"}
 
 Rules:
-- OK is the default. Most bets have no disqualifying issue.
+- OK is the default and the correct answer for the large majority of bets. On a \
+typical slate you should return OK for 85-95% of them.
 - FLAG means a real concern that should reduce confidence but not cancel.
-- KILL means a concrete disqualifying fact, and you MUST cite it in evidence.
-- Never invent facts. If the context does not contain a reason, return OK.
-- Do not comment on whether the edge or price looks good. That is not your job."""
+- KILL means a concrete disqualifying fact, and you MUST quote it in evidence.
+
+MISSING DATA IS NOT EVIDENCE. Empty injury reports, "no forecast available", \
+"not yet declared" and "none recorded" mean we have not collected that data \
+yet. They do NOT mean nothing is wrong, and they are NEVER a reason to FLAG or \
+KILL. Judge only on facts that are actually present.
+
+Other constraints:
+- Never invent facts. If the context contains no stated reason, return OK.
+- Do not comment on whether the edge, price or line looks good. Not your job.
+- Do not speculate about matchups, form, momentum or "trap games". You have no \
+information about those and neither does anyone else.
+- A bet being uncertain is not a reason to object. All bets are uncertain."""
 
 
 def _game_context(game_id: str) -> dict[str, Any]:
@@ -140,6 +151,21 @@ Tier: {pick.get('tier')}
 Is there a disqualifying reason not to place this bet?"""
 
 
+def _evidence_grounded(evidence: str, context_blob: str) -> bool:
+    """Does the cited evidence actually appear in the context we supplied?
+
+    Loose token overlap rather than exact matching — the model paraphrases, and
+    demanding a literal quote would reject legitimate findings. The bar is only
+    that it is talking about something real.
+    """
+    ev_tokens = {t for t in re.findall(r"[a-z0-9]{4,}", evidence.lower())}
+    if not ev_tokens:
+        return False
+    ctx_tokens = {t for t in re.findall(r"[a-z0-9]{4,}", context_blob.lower())}
+    overlap = ev_tokens & ctx_tokens
+    return len(overlap) >= max(1, min(2, len(ev_tokens) // 3))
+
+
 def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     """Review one pick. Always returns a verdict; never raises."""
     if not settings.ENABLE_AI_REDTEAM:
@@ -172,6 +198,27 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     if verdict == "KILL" and len(evidence.strip()) < 12:
         log.info("demoting unevidenced KILL to FLAG: %s", reason[:80])
         verdict, reason = "FLAG", f"(unevidenced) {reason}"
+
+    # Evidence must quote something actually in the context. Models will
+    # otherwise cite the ABSENCE of data — "no injury report available" — as
+    # grounds to object, which would gut a slate whenever ingestion is behind.
+    if verdict in ("KILL", "FLAG"):
+        blob = (str(ctx.get("injuries")) + str(ctx.get("inactives"))
+                + str(ctx.get("weather")) + str(ctx.get("recent_line_moves"))
+                + str(ctx.get("week")) + str(ctx.get("season_type"))
+                + str(ctx.get("home_rest_days")) + str(ctx.get("away_rest_days")))
+        absence_words = ("no forecast", "not yet declared", "none recorded",
+                         "no data", "unavailable", "not available", "missing",
+                         "no injury", "empty", "lack of", "absence of")
+        ev_low = evidence.lower()
+        if any(w in ev_low for w in absence_words):
+            log.info("overriding %s based on missing data: %s", verdict, evidence[:80])
+            verdict, reason, evidence = "OK", "", ""
+        elif not _evidence_grounded(evidence, blob):
+            log.info("downgrading ungrounded %s: %s", verdict, evidence[:80])
+            verdict = "FLAG" if verdict == "KILL" else "OK"
+            if verdict == "OK":
+                reason, evidence = "", ""
 
     return {"verdict": verdict, "reason": reason, "evidence": evidence,
             "source": "model"}
@@ -251,6 +298,13 @@ def apply_to_picks(limit: int = 60) -> dict:
             if r["verdict"] != "OK":
                 changed += 1
 
+    total = max(out["reviewed"], 1)
+    downgrade_rate = (out["counts"].get("KILL", 0) + out["counts"].get("FLAG", 0)) / total
+    if downgrade_rate > 0.30:
+        log.warning("redteam downgraded %.0f%% of the slate — that is high. "
+                    "Check the reasons; a model objecting to most bets is "
+                    "usually reacting to thin context, not real problems.",
+                    downgrade_rate * 100)
     log.info("redteam: %s across %d games, %d downgraded (ai_ran=%s, sources=%s)",
              out["counts"], out["games"], changed, out["ai_ran"], out["sources"])
     return {"reviewed": out["reviewed"], "games": out["games"],

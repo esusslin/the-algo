@@ -629,7 +629,13 @@ def ai_usage(admin: dict = Depends(auth.current_admin)) -> dict:
 @app.post("/api/admin/redteam")
 def run_redteam(admin: dict = Depends(auth.current_admin)) -> dict:
     from src.ai.redteam import apply_to_picks
-    return apply_to_picks()
+    out = apply_to_picks()
+    # return the actual verdicts so a high downgrade rate can be diagnosed
+    out["verdicts"] = [dict(r) for r in query(
+        "SELECT pick_id, tier, published, ai_verdict, ai_reason, headline "
+        "FROM picks WHERE ai_verdict IN ('FLAG','KILL') "
+        "ORDER BY pick_id DESC LIMIT 20")]
+    return out
 
 
 @app.get("/api/admin/sms-status")

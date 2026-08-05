@@ -508,6 +508,20 @@
         Review picks
       </button>
       <p class="text-xs text-slate-400 mt-3" x-text="rtMsg"></p>
+      <p x-show="rtHigh" class="text-xs text-amber-400 mt-1">
+        That's a high downgrade rate. Check the reasons below — a model objecting
+        to most bets is usually reacting to thin context, not real problems.
+      </p>
+      <div x-show="(rtVerdicts||[]).length" class="mt-2 space-y-1">
+        <template x-for="v in rtVerdicts" :key="v.pick_id">
+          <div class="text-[11px] border-t border-slate-800 pt-1">
+            <span :class="v.ai_verdict==='KILL'?'text-red-400':'text-amber-400'"
+                  x-text="v.ai_verdict"></span>
+            <span class="text-slate-400" x-text="' · '+(v.headline||'')"></span>
+            <p class="text-slate-500" x-text="v.ai_reason"></p>
+          </div>
+        </template>
+      </div>
       <div class="grid grid-cols-2 gap-y-1 text-xs mt-3 pt-3 border-t border-slate-800">
         <span class="text-slate-500">AI configured</span>
         <span :class="ai.configured ? 'text-slate-200' : 'text-amber-400'"
@@ -594,7 +608,7 @@ function algo(){return{
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
   betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
-  showWhy:null,
+  showWhy:null, rtVerdicts:[], rtHigh:false,
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -759,6 +773,8 @@ function algo(){return{
         this.rtMsg = `${d.reviewed_by_model} of ${d.reviewed} picks reviewed by the `
           +`model across ${d.games} games — ${c.OK||0} ok, ${c.FLAG||0} flagged, `
           +`${c.KILL||0} killed (${d.changed} downgraded)`;
+        this.rtVerdicts = d.verdicts||[];
+        this.rtHigh = d.reviewed ? ((c.FLAG||0)+(c.KILL||0))/d.reviewed > 0.30 : false;
       }
     }catch(e){ this.rtMsg='Failed: '+e.message }
     await this.refresh();
