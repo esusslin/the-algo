@@ -68,6 +68,14 @@ class PropProjection:
     sd: float
     n_games: int
     confident: bool
+    # Probability of a "bust" game — injured early, benched, buried by game
+    # script. These produce near-zero outcomes that a single lognormal cannot
+    # accommodate, which showed up as the bottom decile carrying twice its
+    # expected mass. Modelling participation separately from performance is the
+    # standard fix and it matters commercially: unders on a star are largely a
+    # bet on this probability, not on his yards-per-target.
+    p_bust: float = 0.0
+    bust_mean: float = 0.0
 
     def _lognormal_params(self) -> tuple[float, float]:
         var = self.sd ** 2
@@ -75,15 +83,33 @@ class PropProjection:
         sigma = math.sqrt(math.log(1 + var / self.mean ** 2))
         return mu, sigma
 
+    def _normal_cdf(self, x: float, mean: float, sd: float) -> float:
+        if sd <= 0:
+            return 1.0 if x >= mean else 0.0
+        mu = math.log(mean ** 2 / math.sqrt(sd ** 2 + mean ** 2))
+        sigma = math.sqrt(math.log(1 + sd ** 2 / mean ** 2))
+        z = (math.log(max(x, 1e-9)) - mu) / sigma
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+
     def cdf(self, x: float) -> float:
-        """P(X <= x). The distribution itself, which is what prices a prop."""
+        """P(X <= x) — a two-component mixture.
+
+            P(X <= x) = p_bust · F_bust(x) + (1 - p_bust) · F_normal(x)
+
+        The bust component carries the mass near zero that a single lognormal
+        pushes into the body of the distribution, which is what inflated the
+        bottom decile and starved the middle.
+        """
         if self.sd <= 0 or self.mean <= 0:
             return 0.5
         if x <= 0:
             return 0.0
-        mu, sigma = self._lognormal_params()
-        z = (math.log(x) - mu) / sigma
-        return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+        normal_part = self._normal_cdf(x, self.mean, self.sd)
+        if self.p_bust <= 0:
+            return normal_part
+        bust_part = self._normal_cdf(x, max(self.bust_mean, 0.5),
+                                     max(self.bust_mean, 0.5) * 0.9)
+        return self.p_bust * bust_part + (1 - self.p_bust) * normal_part
 
     def prob_over(self, line: float) -> float:
         """P(X > line).
@@ -201,29 +227,45 @@ def project(history: list[dict], stat: str, player_id: str,
     if n < MIN_GAMES:
         return None
 
+    vol_key = {"rec_yards": "targets", "rush_yards": "carries",
+               "receptions": "targets"}[stat]
     if stat == "rec_yards":
-        vols = [h["targets"] for h in history]
-        effs = [(h["rec_yards"] / h["targets"])
-                for h in history if h["targets"] and h["rec_yards"] is not None]
+        effs_all = [(h["rec_yards"] / h["targets"])
+                    for h in history if h["targets"] and h["rec_yards"] is not None]
         k_eff, prior_eff = K_YPT, priors.get("ypt", 7.8)
     elif stat == "rush_yards":
-        vols = [h["carries"] for h in history]
-        effs = [(h["rush_yards"] / h["carries"])
-                for h in history if h["carries"] and h["rush_yards"] is not None]
+        effs_all = [(h["rush_yards"] / h["carries"])
+                    for h in history if h["carries"] and h["rush_yards"] is not None]
         k_eff, prior_eff = K_YPC, priors.get("ypc", 4.3)
     elif stat == "receptions":
-        vols = [h["targets"] for h in history]
-        effs = [(h["receptions"] / h["targets"])
-                for h in history if h["targets"] and h["receptions"] is not None]
+        effs_all = [(h["receptions"] / h["targets"])
+                    for h in history if h["targets"] and h["receptions"] is not None]
         k_eff, prior_eff = 10.0, priors.get("catch_rate", 0.65)
     else:
         return None
 
-    if not vols:
+    all_vols = [h[vol_key] or 0 for h in history]
+    if not all_vols:
         return None
 
+    # Split participation from performance. A "bust" is a game with volume far
+    # below the player's own norm — injury, benching, game script. Fitting the
+    # main distribution to these mixed together is what pushed excess mass into
+    # the bottom decile.
+    typical = float(np.median([v for v in all_vols if v > 0]) or 0)
+    bust_cut = max(1.0, typical * 0.35)
+    normal_vols = [v for v in all_vols if v >= bust_cut]
+    bust_vols = [v for v in all_vols if v < bust_cut]
+
+    p_bust = len(bust_vols) / len(all_vols) if all_vols else 0.0
+    # Shrink toward a positional base rate: three quiet games early in a season
+    # shouldn't imply a 40% bust probability.
+    p_bust = _shrink(p_bust, priors.get("bust_rate", 0.12), len(all_vols), 6.0)
+
+    vols = normal_vols or all_vols
     vol_mean = float(np.mean(vols))
     vol_sd = float(np.std(vols, ddof=1)) if len(vols) > 1 else vol_mean * 0.5
+    effs = effs_all
 
     if effs:
         eff_raw = float(np.mean(effs))
@@ -240,12 +282,15 @@ def project(history: list[dict], stat: str, player_id: str,
     var = (vol_sd**2 * eff_sd**2) + (vol_sd**2 * eff_mean**2) + (eff_sd**2 * vol_mean**2)
     sd = float(np.sqrt(max(var, 1e-9)))
 
+    bust_mean = float(np.mean(bust_vols)) * eff_mean if bust_vols else mean * 0.15
     return PropProjection(
         player_id=player_id, stat=stat,
         volume_mean=round(vol_mean, 2), volume_sd=round(vol_sd, 2),
         eff_mean=round(eff_mean, 3), eff_sd=round(eff_sd, 3),
         mean=round(mean, 1), sd=round(sd, 1),
-        n_games=n, confident=n >= 6)
+        n_games=n, confident=n >= 6,
+        p_bust=round(min(p_bust, 0.45), 4),
+        bust_mean=round(max(bust_mean, 0.3), 2))
 
 
 @dataclass
@@ -277,7 +322,8 @@ class Calibration:
             eff_mean=p.eff_mean, eff_sd=p.eff_sd,
             mean=max(0.1, p.mean + self.bias),
             sd=max(0.1, p.sd * self.sd_scale),
-            n_games=p.n_games, confident=p.confident)
+            n_games=p.n_games, confident=p.confident,
+            p_bust=p.p_bust, bust_mean=p.bust_mean)
 
 
 def fit_calibration(stat: str, hist: dict[str, list[dict]],
