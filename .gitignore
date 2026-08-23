@@ -48,3 +48,4 @@ mlruns/
 .idea/
 .vscode/
 *.swp
+run_logs.txt
