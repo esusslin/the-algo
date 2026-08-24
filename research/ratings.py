@@ -192,19 +192,57 @@ def build_ratings(seasons: list[int] | None = None,
 
 
 def rating_as_of(season: int, week: int, team: str,
-                 play_class: str = "all") -> dict | None:
-    """What we knew about a team going into a given week. The point-in-time read."""
+                 play_class: str = "all", *, shrink_to_prior: bool = True) -> dict | None:
+    """What we knew about a team going into a given week. The point-in-time read.
+
+    **`shrink_to_prior` defaults on, and the default is the interesting part.** Without
+    it, a Week 2 rating is computed from one game and reported with the same authority as
+    a Week 15 rating computed from fourteen — and a *missing* rating becomes zero
+    downstream, which reads as "exactly league average" rather than "we don't know".
+
+    With it, the rating is blended toward last season's regressed rating in proportion to
+    how little has been observed: `(n/(n+k))*observed + (k/(n+k))*prior`. `k` is fitted
+    per play class by walk-forward (`research.coldstart fit`) and beats the unshrunk
+    rating on a held-out season by 7-15% MAE.
+
+    Pass `shrink_to_prior=False` to see the raw within-season number — which is what you
+    want when debugging the ridge fit itself, and never what you want as a model feature
+    before about Week 8.
+    """
     con = connect(read_only=True)
     row = con.execute("""
         SELECT off_rating, def_rating, off_plays, def_plays, confident
         FROM unit_ratings
         WHERE season=? AND week=? AND team=? AND play_class=?
     """, [season, week, team, play_class]).fetchone()
+
+    out: dict | None = None
+    if row:
+        out = {"off_rating": row[0], "def_rating": row[1], "off_plays": row[2],
+               "def_plays": row[3], "confident": bool(row[4]), "shrunk": False}
+
+        if shrink_to_prior:
+            prior = con.execute("""
+                SELECT off_prior, def_prior FROM team_priors
+                WHERE season=? AND team=? AND play_class=?
+            """, [season, team, play_class]).fetchone()
+            if prior is not None:
+                # Imported here rather than at module scope: `coldstart` imports from
+                # this module's package and a top-level import would be circular.
+                from research.coldstart import k_for, shrink
+
+                k = k_for(play_class)
+                out["off_rating_raw"] = out["off_rating"]
+                out["def_rating_raw"] = out["def_rating"]
+                out["off_rating"] = shrink(row[0], row[2] or 0, prior[0], k)
+                out["def_rating"] = shrink(row[1], row[3] or 0, prior[1], k)
+                out["shrunk"] = True
+                out["prior_weight"] = round(k / ((row[2] or 0) + k), 3)
+            # No prior row — an expansion team, or the first season in the data. The
+            # raw rating stands and `shrunk` stays False, so a caller can tell the
+            # difference between "blended" and "nothing to blend with".
     con.close()
-    if not row:
-        return None
-    return {"off_rating": row[0], "def_rating": row[1], "off_plays": row[2],
-            "def_plays": row[3], "confident": bool(row[4])}
+    return out
 
 
 def matchup(season: int, week: int, home: str, away: str) -> dict:
