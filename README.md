@@ -3,12 +3,21 @@
 NFL betting model + pick engine. Multi-model predictions across sides, totals, derivatives,
 and player props, with market-relative edge detection and CLV tracking.
 
-> **Status: work in progress, and honest about it.** The pipeline runs end to end and has
-> been in production since August 2026. The *model* is thin — 27 live features against a
-> closing line that already contains most of what's knowable, and a measured result of
-> **50.0%**, which is to say no edge at all. What's built is the infrastructure to find one
-> and the discipline to know whether it did. See [What is actually
-> finished](#what-is-actually-finished) before reading anything below as a claim.
+> **Status: work in progress, and honest about it.**
+>
+> **What runs in production today is a market engine, not a model.** Picks come from
+> devigged consensus fair prices shopped against 23 books — line shopping, which is a real
+> edge source and the one that doesn't require beating anybody's forecast. No trained model
+> has ever priced a live pick: the artifact registry is empty, `PUBLISH_MODEL_PICKS` is
+> false, and the serving plane has no feature-vector path at all.
+>
+> **That is a decision, not an omission.** The model was trained on 27 features and
+> walk-forward validated at **50.0%** against the closing spread — no edge. Shipping it
+> anyway would have meant publishing picks driven by a forecast measured to be worthless.
+> It stays offline until a retrain says otherwise.
+>
+> See [What is actually finished](#what-is-actually-finished) before reading anything below
+> as a claim.
 
 ---
 
@@ -84,12 +93,19 @@ polls.
 | Raw data collected | 546 MB, 13 sources, 1999–2025 |
 | Warehouse rows | ~1.3M across 11 views + 4 derived tables |
 | Features declared in `shared/feature_spec.py` | 36 |
-| **Features the model has actually seen** | **27** |
+| Features the model saw **in training** | 27 |
 | Features pinned to constants | 9 |
+| **Features affecting a production pick** | **0** |
 
-That's why the 50.0% result is a *narrow* claim. It says team strength, rest and venue
-don't beat the closing spread. It says nothing about weather, injuries or market
-microstructure, because none of them were in the model when it was measured.
+That last row is the important one. The research plane trains and validates; the serving
+plane prices picks from the market alone. **The bridge between them — a serving-side
+feature builder and an exported bundle — does not exist**, because the model measured
+50.0% and there was nothing worth bridging.
+
+Which also makes the 50.0% a *narrow* claim. It says team strength, rest and venue don't
+beat the closing spread. It says nothing about weather, injuries or market
+microstructure, because none of them were in the model when it was measured — and two of
+those three now have data waiting.
 
 ### Where the LLM sits — and where it deliberately doesn't
 
@@ -255,10 +271,9 @@ notebook to a hedge fund, and the difference matters.
 
 | | what | why it isn't done |
 |---|---|---|
-| 1 | **Injury features in the model** | The availability block in `feature_spec.py` is commented out. The signal is measured and [Omaha](https://github.com/esusslin/omaha) now produces typed records — this is wiring, not research. |
-| 2 | **Weather features** | Collected 4× daily since August, pinned to constants in the model. Same shape as above: the data is there, the feature isn't. |
-| 3 | **Blend-weight adaptation from CLV** | The most valuable unbuilt thing here. `w` is fit once offline; it should drift weekly from measured closing-line value, capped at ±0.02/week, floored at 30 picks, bounded to [0, 0.6]. Needs several weeks of live picks before it can act. |
-| 4 | **Market microstructure** | Cannot be backfilled. `odds_changes` holds one timestamp; September's polls are the only training set these features will ever have. |
+| 1 | **A retrain that includes what's now available** | Injuries (5,299 rows live, signal measured at +0.054 AUC), weather (from 30 Aug), and market microstructure (78 distinct line-movement timestamps across three weeks — see the correction in `DATA_INVENTORY.md` §5). Three of the nine pinned features have data today. **This decides everything below it**: if the null result holds with a wider feature set, the model shouldn't ship at all. |
+| 2 | **A serving-side feature path** | The blocker nobody had named. `research/features.py` builds vectors from DuckDB; nothing in `src/` builds one, so `model_prob` is never computed and `blended_probability` degrades to market-only by design. Only worth building if item 1 moves the number. |
+| 3 | **Blend-weight adaptation from CLV** | `w` is fit once offline; it should drift weekly from measured closing-line value, capped at ±0.02/week, floored at 30 picks, bounded to [0, 0.6]. Needs live picks *and* items 1–2. |
 | 5 | **Prop engine** | Distributional projections and the hurdle model exist in `research/props.py`; the serving path and 1H markets don't. |
 | 6 | **QB-conditional ratings** | A backup start currently corrupts a team's rating for weeks. Needs the injury feed above. |
 | 7 | **State-space team ratings** | The principled answer to mid-season regime change. Ridge + recency weighting is the stopgap. |
