@@ -14,7 +14,7 @@ separates the mechanisms by how much they actually matter.
 |---|---|---|---|
 | **Feature updating** | weekly, automatic | **Large** | already built |
 | **Blend-weight adaptation** | weekly, from CLV | **Large** | not built |
-| **Cold-start shrinkage** | weeks 1–6 | **Large early** | not built |
+| **Cold-start shrinkage** | weeks 1–6 | **Large early** | **built 24 Aug** |
 | **Tier threshold tuning** | monthly, from CLV | Moderate | not built |
 | Model retraining | weekly | **Small** | planned |
 
@@ -82,7 +82,14 @@ adapting on it would fit randomness.
 
 ---
 
-## 3. Cold-start shrinkage (weeks 1–6 — not built)
+## 3. Cold-start shrinkage (weeks 1–6 — **built**)
+
+`research/coldstart.py`. Priors are last season's final rating regressed 55% toward the
+mean; `k` is fitted per play class by walk-forward; `rating_as_of` blends by default and
+reports `prior_weight` so a caller can see how much of a rating is prior rather than
+observation. Still to do: the prior is one number, and roster continuity, draft capital
+and a coaching-change variance bump all belong in it (see below).
+
 
 Week 1 features are pure prior. Week 10 features are pure observation. The
 transition should be explicit rather than emergent:
@@ -93,15 +100,45 @@ strength = (n/(n+k)) · observed + (k/(n+k)) · prior
 
 where `n` = current-season games and `k` is fit per feature by walk-forward.
 
-`k` differs a lot by statistic, and this is worth measuring rather than guessing:
+`k` differs a lot by statistic, and this is worth measuring rather than guessing.
 
-| Feature | Stabilises | Rough `k` |
+**Measured 24 Aug 2026** (`research/coldstart.py fit`, trained 2013–2024, held out on
+2025). `k` is in **plays**, not games — a team runs roughly 35 pass and 25 rush plays per
+game, so the game equivalents differ from the raw numbers:
+
+| Unit rating | fitted `k` (plays) | ≈ games | holdout MAE | vs no prior |
+|---|---|---|---|---|
+| all | 240 | ~4 | 0.10128 | 0.11218 (−9.7%) |
+| pass | 240 | ~7 | 0.13278 | 0.14224 (−6.6%) |
+| rush | 120 | ~5 | 0.08918 | 0.10488 (−15.0%) |
+
+All three beat the no-prior baseline on a season the fit never saw, which is what
+justified shipping it as the default in `rating_as_of`.
+
+**The measurement contradicts the table this section used to contain.** That table —
+kept below — asserted pass EPA stabilises fast (~4 games) and rush EPA slowly (~10). The
+fit says the opposite: rush wants roughly *half* the shrinkage pass does.
+
+| Feature | Assumed | Rough `k` assumed |
 |---|---|---|
 | Pass EPA | fast | ~4 games |
 | Success rate | fast | ~4 games |
 | Rush EPA | slow | ~10 games |
 | Turnover margin | mostly luck | ~16+ games |
 | Fumble recovery rate | pure luck | never — shrink fully to mean |
+
+Two candidate explanations, neither yet tested:
+
+1. **These aren't raw EPA.** `unit_ratings` are ridge-decomposed and opponent-adjusted,
+   so they already shrink toward league average. The residual instability isn't the
+   quantity the raw-EPA rule of thumb describes.
+2. **Rush usage is more scheme-stable.** Pass volume swings with game script — a team
+   trailing throws — while carries reflect identity more than circumstance.
+
+Turnover margin and fumble recovery remain unmeasured; they aren't unit ratings and
+would need their own fit. Recorded as an open disagreement rather than resolved, because
+a measured number and a rule of thumb disagreeing is worth understanding, not papering
+over.
 
 **Priors themselves need construction**, not just last season's number:
 prior-season rating regressed to mean, plus roster turnover (snap-weighted
