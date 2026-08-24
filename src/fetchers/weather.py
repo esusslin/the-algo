@@ -151,7 +151,22 @@ def fetch_for_games(games: list[dict], historical: bool = False) -> int:
 
 
 def refresh_upcoming(days_ahead: int = 10) -> int:
-    """Forecast for games kicking off soon. Called on a schedule."""
+    """Forecast for games kicking off soon. Called on a schedule.
+
+    **Do not widen `days_ahead` past ~14.** Open-Meteo's forecast endpoint serves roughly
+    fifteen days and returns 400 beyond that — `"Parameter 'start_date' is out of allowed
+    range"` — which surfaces here as a RetryError wrapping an HTTPStatusError, three
+    attempts per game, for every game out of range. Verified 24 Aug 2026: a date 2 days
+    out returned 200, 16 days out returned 400.
+
+    The consequence is that in the preseason this legitimately writes zero rows and marks
+    itself successful, because no game is within the window yet. `source_freshness.detail`
+    records `"0 of N games"` so the difference between "nothing to do" and "nothing
+    worked" is visible — but `/health` cannot distinguish them at the `ok` level, which is
+    worth remembering before diagnosing an empty `weather_snapshots` table in August.
+
+    In season it is never a constraint: games are always within a week.
+    """
     cutoff = (datetime.now(timezone.utc) + timedelta(days=days_ahead)).isoformat()
     games = [dict(r) for r in query(
         "SELECT game_id, home_team, kickoff_utc, roof FROM games "

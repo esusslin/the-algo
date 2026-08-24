@@ -93,13 +93,44 @@ weeks, which is what makes it usable as a training feature without leakage.
 (this is the local dev copy; Railway has the real ones), `ai_calls`, `job_runs`,
 `live_state`, `live_player_stats`, `projections`, `artifact_registry`.
 
-**Empty and worth noting:** `injuries` and `weather_snapshots` are both at zero.
-The historical injury data is in parquet, but the live serving table hasn't been
-populated — the Wed/Thu/Fri cron hasn't had a real week to run against yet.
+**Empty and worth noting** — again, this described the local copy. Production on 24 Aug:
+
+| table | production | status |
+|---|---|---|
+| `injuries` | **5,299 rows** | Working. 25 rows available for the Week 1 opener. |
+| `weather_snapshots` | 0 | **Not broken.** Open-Meteo forecasts ~15 days out and `refresh_upcoming` bounds itself to 10; Week 1 is 16 days away, so it correctly selects zero games. Populates from ~30 Aug. |
+| `inactives` | 0 | **Genuinely dead.** The table is created in `db.py` and read by `redteam.py`, and *nothing writes it*. Not a broken job — no writer was ever built. |
+
+`inactives` is the only real hole of the three, and the fix is upstream: Omaha already
+collects inactives articles, which use a `POS Name | Number` shape that's a small regex
+from being structured.
 
 ---
 
-## 5. The gap that matters most
+## 5. The gap that matters most — **corrected 24 Aug 2026**
+
+> **This section was wrong, and the error was measuring the wrong database.** Everything
+> below was read from the *local dev copy* of `nfl.db`, which is a stale snapshot. Checked
+> against **production** on 24 Aug:
+>
+> | | local (17 Aug) | production (24 Aug) |
+> |---|---|---|
+> | `odds_changes` rows | 5,678 | **15,377** |
+> | distinct timestamps | **1** | **78** |
+> | span | one instant | 4 Aug → 24 Aug |
+> | distinct observations, Week 1 opener | — | **54** |
+>
+> **Line-movement history exists and has been accumulating for three weeks.** The three
+> market-microstructure features — `line_move_spread`, `book_dispersion`,
+> `sharp_soft_delta` — are buildable *now*, on 272 games, rather than "forward from
+> September". The closing-line model in `PROP_ENGINE_DESIGN.md` §5 has a training set
+> today.
+>
+> The lesson is more useful than the correction: **an inventory generated from a
+> developer's laptop describes the laptop.** Every count in this document should be
+> re-read against production before being planned around.
+
+The original text follows, for the record.
 
 **`odds_changes` contains a single timestamp: 2026-08-03T14:52:21Z.**
 
