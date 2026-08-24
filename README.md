@@ -3,6 +3,114 @@
 NFL betting model + pick engine. Multi-model predictions across sides, totals, derivatives,
 and player props, with market-relative edge detection and CLV tracking.
 
+> **Status: work in progress, and honest about it.** The pipeline runs end to end and has
+> been in production since August 2026. The *model* is thin — 27 live features against a
+> closing line that already contains most of what's knowable, and a measured result of
+> **50.0%**, which is to say no edge at all. What's built is the infrastructure to find one
+> and the discipline to know whether it did. See [What is actually
+> finished](#what-is-actually-finished) before reading anything below as a claim.
+
+---
+
+## What it eats, and what it actually digests
+
+The gap between those two is the most important thing on this page.
+
+```mermaid
+flowchart LR
+    subgraph collected["COLLECTED — 546 MB, 1999-2025"]
+        pbp["play-by-play<br/>1.28M plays"]
+        stats["player + team weekly<br/>476k rows"]
+        snaps["snap counts<br/>325k rows"]
+        inj["injuries<br/>90k rows"]
+        ngs["NextGen / FTN / PFR<br/>charting"]
+        depth["depth charts"]
+        dead["contracts, draft, combine<br/><i>unused</i>"]
+    end
+
+    subgraph derived["DERIVED — warehouse"]
+        ratings["unit_ratings<br/>ridge, opponent-adjusted<br/>point-in-time"]
+        pw["player_weeks<br/>shares, EPA/target"]
+        tw["team_weeks<br/>pace, splits"]
+        xwalk["pfr to gsis crosswalk<br/>99.6%"]
+    end
+
+    subgraph live["LIVE FEEDS"]
+        odds["Odds API<br/>23 books x 3 markets"]
+        wx["weather by stadium"]
+        omaha["Omaha<br/>typed injury records"]
+    end
+
+    subgraph model["MODEL — 27 live features"]
+        feats["market spread + total<br/>rest, division, dome, slot, week<br/>12 unit ratings<br/>6 matchup edges"]
+    end
+
+    subgraph dormant["DECLARED BUT PINNED TO CONSTANTS"]
+        pinned["wind, gusts, temp, precip<br/>market_home_prob<br/>line_move, dispersion, sharp_soft"]
+    end
+
+    pbp --> ratings
+    stats --> pw
+    pbp --> tw
+    snaps --> xwalk
+    ratings --> feats
+    tw --> feats
+    odds --> feats
+    wx -.never wired.-> pinned
+    inj -.never wired.-> pinned
+    omaha -.next.-> pinned
+    pw -.props only.-> feats
+
+    feats --> blend
+    odds --> blend["BLEND<br/>w on model, 1 minus w on market<br/>in logit space"]
+    blend --> tier["TIER + KELLY<br/>edge %, correlation haircut"]
+    tier --> agent{{"RED TEAM<br/>LLM veto"}}
+    agent --> picks["PICKS"]
+
+    style dormant fill:#3a2020,stroke:#a04040
+    style dead fill:#3a2020,stroke:#a04040
+    style model fill:#1f3a1f,stroke:#40a040
+    style agent fill:#2a2a4a,stroke:#6060c0
+```
+
+**Read the dotted lines.** Weather is collected four times a day and has never reached the
+model. Injuries are collected Wednesday, Thursday and Friday and have never reached the
+model. Line movement can't reach it, because `odds_changes` holds a single timestamp and
+history cannot be backfilled — those features can only be filled forward from September's
+polls.
+
+| | count |
+|---|---|
+| Raw data collected | 546 MB, 13 sources, 1999–2025 |
+| Warehouse rows | ~1.3M across 11 views + 4 derived tables |
+| Features declared in `shared/feature_spec.py` | 36 |
+| **Features the model has actually seen** | **27** |
+| Features pinned to constants | 9 |
+
+That's why the 50.0% result is a *narrow* claim. It says team strength, rest and venue
+don't beat the closing spread. It says nothing about weather, injuries or market
+microstructure, because none of them were in the model when it was measured.
+
+### Where the LLM sits — and where it deliberately doesn't
+
+One place only: a **red-team agent that can downgrade a pick and never upgrade one.**
+
+It runs after the model has produced a probability and after Kelly has sized it. It reads
+evidence — injury records, weather, line movement — and argues against publishing. It
+cannot raise a tier, cannot increase a stake, and cannot emit a number.
+
+> **Models produce numbers. Agents produce evidence. Agents never emit a probability.**
+
+That constraint is structural, not stylistic. An LLM-produced probability has no
+calibration curve and no way to tell whether a prompt change improved it or merely moved
+it. A number you cannot backtest is a number you cannot bet.
+
+It has already failed once in an instructive way: it downgraded **41%** of picks when
+weather data was merely *missing*, having read "no value" as "bad value". That is why
+[Omaha](https://github.com/esusslin/omaha) — the document layer that feeds this — reports
+whether an absence means *healthy* or *unknown*, rather than returning an empty list and
+letting the agent guess.
+
 Design docs live outside this repo:
 - `nfl_betting_system_architecture.md` — what and why (data sources, models, validation, betting ops)
 - `nfl_implementation_architecture.md` — how (two-plane design, schema, AI agents, UI, build calendar)
@@ -113,10 +221,60 @@ is overdue. Point an external uptime pinger at it and alert on `ok`, not status 
 
 ---
 
-## Status
+## What is actually finished
 
-**Built:** repo scaffold, config, SQLite schema + migrations, nflverse ingestion with runtime
-asset discovery, injury feed, FastAPI + APScheduler service, health monitoring.
+Stated at this granularity because "built a betting model" covers everything from a
+notebook to a hedge fund, and the difference matters.
 
-**Next (per build calendar):** Odds API client with adaptive polling + credit ledger, devig
-module, cross-book shopping, market edge engine, pick tiering, mobile UI.
+### Working, in production
+
+- **Ingestion.** 13 nflverse sources with runtime asset discovery, Odds API polling with
+  adaptive tiers and a credit ledger, weather by stadium, injuries Wed/Thu/Fri.
+- **Research warehouse.** DuckDB over parquet, 11 views, 4 derived tables. `unit_ratings`
+  is ridge-decomposed and computed point-in-time — each week uses only earlier weeks.
+- **pfr→gsis crosswalk**, 99.6% of snap ids, coverage asserted in `verify()`.
+- **Market machinery.** Four devig methods, per-book consensus with sharp anchoring,
+  cross-book shopping, edge detection.
+- **Pick pipeline.** Tiering, fractional Kelly with correlation haircuts, settlement,
+  closing-line capture.
+- **Cold-start shrinkage.** `k` fitted per play class by walk-forward; beats the no-prior
+  baseline by 7–15% MAE on a held-out season.
+- **Validation.** Leakage suite, walk-forward against a market baseline, a 55% accuracy
+  tripwire, hash-validated artifact bundles.
+- **Observability.** `/health` reports per-source staleness and job outcomes, not liveness.
+
+### Measured, and negative
+
+- **50.0% against the closing spread.** Real result, narrow scope — team strength, rest
+  and venue only. Not a statement about weather, injuries or microstructure.
+- **Practice participation carries signal.** +0.054 AUC on the Questionable panel across
+  90,467 injury rows, walk-forward by season. Measured *before* building the pipeline that
+  would use it.
+
+### Not built, in the order it matters
+
+| | what | why it isn't done |
+|---|---|---|
+| 1 | **Injury features in the model** | The availability block in `feature_spec.py` is commented out. The signal is measured and [Omaha](https://github.com/esusslin/omaha) now produces typed records — this is wiring, not research. |
+| 2 | **Weather features** | Collected 4× daily since August, pinned to constants in the model. Same shape as above: the data is there, the feature isn't. |
+| 3 | **Blend-weight adaptation from CLV** | The most valuable unbuilt thing here. `w` is fit once offline; it should drift weekly from measured closing-line value, capped at ±0.02/week, floored at 30 picks, bounded to [0, 0.6]. Needs several weeks of live picks before it can act. |
+| 4 | **Market microstructure** | Cannot be backfilled. `odds_changes` holds one timestamp; September's polls are the only training set these features will ever have. |
+| 5 | **Prop engine** | Distributional projections and the hurdle model exist in `research/props.py`; the serving path and 1H markets don't. |
+| 6 | **QB-conditional ratings** | A backup start currently corrupts a team's rating for weeks. Needs the injury feed above. |
+| 7 | **State-space team ratings** | The principled answer to mid-season regime change. Ridge + recency weighting is the stopgap. |
+
+### Known-wrong, tracked
+
+- `injuries` resolves 23% by ID and 13% not at all (`gsis=147 name=405 ambiguous=18
+  unresolved=67` of 648). Name matching is a bridge, not a solution.
+- Live `injuries` and `weather_snapshots` tables are empty — the historical data is in
+  parquet and the serving tables have never had a real game week.
+- 2025 is the one season where the practice signal goes negative on the Questionable
+  panel. One season, n=327, recorded rather than smoothed over.
+
+### What "finished" would mean
+
+A season of live picks with measured CLV by tier and market class, blend weights that have
+adapted from that CLV, and an honest answer to whether any of it beats the closing line.
+That answer may well be no. The system is built so that a no is *legible* rather than
+deniable — which is the only version of this worth running.
