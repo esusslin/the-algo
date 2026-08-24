@@ -12,6 +12,13 @@ cause was a missing throttle, since fixed. Whether the *corrected* schedules fit
 the plan is still an open question, and the honest way to answer it is arithmetic over
 the real tier tables rather than a guess.
 
+**Outcome, 23 Aug 2026.** Corrected schedules come to ~38,000 credits/month with props
+enabled, of which props are ~18,000. That didn't fit the 20,000 plan, so the choice was
+upgrade or trim `PROPS_CORE`. Upgraded to 100,000, on the reasoning that an upgrade is
+reversible next month and a trimmed market list silently becomes the permanent shape of
+the system — and props are where the softest prices are. 38% of budget leaves room for a
+17-game week and a wider region list if Pinnacle coverage needs it.
+
 `TIERS` is imported from `src.fetchers.odds_api`, not copied. A simulator that drifts
 from the code it models is worse than none: it produces a confident wrong number.
 
@@ -185,7 +192,19 @@ def report(result: Result, *, budget: int, weeks_per_month: float, label: str) -
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--budget", type=int, default=20_000)
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=100_000,
+        help=(
+            "monthly credit allowance. Default tracks the current Odds API plan — this "
+            "was 20,000 until the simulator showed props alone cost ~18,000/month, at "
+            "which point the choice was upgrade or permanently trim markets. Upgrading "
+            "is reversible; a trimmed market list quietly becomes the permanent shape "
+            "of the system. Keep this in step with the plan, or the script reports a "
+            "failure that isn't one and you learn to ignore it."
+        ),
+    )
     parser.add_argument("--weeks-per-month", type=float, default=4.3)
     parser.add_argument("--no-props", action="store_true", help="model ENABLE_PROPS=false")
     parser.add_argument(
