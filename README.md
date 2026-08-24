@@ -107,6 +107,83 @@ beat the closing spread. It says nothing about weather, injuries or market
 microstructure, because none of them were in the model when it was measured — and two of
 those three now have data waiting.
 
+### Two markets, two completely different machines
+
+The most common misreading of this system is that it has one pipeline with data sources
+weighted against each other. It doesn't. Full-game markets and player props work by
+different mechanisms, and only one of them is running.
+
+```mermaid
+flowchart TB
+    subgraph fullgame["FULL-GAME: spread, total, moneyline — RUNNING"]
+        direction TB
+        books["23 books x 3 markets<br/>polled on a kickoff-aware schedule"]
+        devig["DEVIG each book<br/>multiplicative / additive / power / Shin"]
+        cons["CONSENSUS<br/>weighted median, anchored on sharp books"]
+        shop["SHOP<br/>best available price vs consensus fair price"]
+        edge["EDGE %<br/>this is the whole signal"]
+        books --> devig --> cons --> shop --> edge
+    end
+
+    subgraph blend["MODEL vs MARKET — weight is currently ZERO"]
+        w["w on model, 1 minus w on market<br/>in log-odds space<br/><br/>w = 0 for every market<br/>measured: model is worse than a coin flip"]
+    end
+
+    subgraph props["PLAYER PROPS — DESIGNED, NOT BUILT"]
+        direction TB
+        l0["Layer 0 — P active<br/><i>does he play at all</i>"]
+        l1["Layer 1 — snap share given active<br/><i>how much does he play</i>"]
+        l2["Layer 2 — opportunities<br/><i>targets, carries, routes</i>"]
+        l3["Layer 3 — per-opportunity outcome<br/><i>yards given a target</i>"]
+        l4["Layer 4 — compose distribution"]
+        l5["Layer 5 — correlation across props"]
+        l0 --> l1 --> l2 --> l3 --> l4 --> l5
+    end
+
+    subgraph feeds["WHAT FEEDS THE PROP LAYERS"]
+        inj["injury + practice status<br/><i>Omaha</i>"]
+        script["game script from the market<br/><i>spread magnitude, implied total</i>"]
+        call["play-calling tendency<br/><i>pbp, FTN charting</i>"]
+        match["matchup adjustment<br/><i>NextGen, unit ratings</i>"]
+    end
+
+    inj --> l0
+    script --> l1
+    call --> l2
+    match --> l3
+
+    edge --> blend
+    l5 -.not yet.-> blend
+    blend --> tier["TIER + KELLY<br/>correlation haircuts"]
+    tier --> rt{{"RED TEAM<br/>downgrade only"}}
+    rt --> out["PUBLISHED PICKS"]
+
+    style fullgame fill:#1f3a1f,stroke:#40a040
+    style props fill:#3a3020,stroke:#a08040
+    style blend fill:#3a2020,stroke:#a04040
+    style rt fill:#2a2a4a,stroke:#6060c0
+```
+
+**Read the green box first.** That's the entire product today, and there is no model in
+it. Picks are price discrepancies: devig 23 books, build a sharp-anchored consensus, and
+find where somebody is offering better than the market's own fair price. Line shopping is
+a real edge and the one that doesn't require out-forecasting anyone.
+
+**The red box is where all the weighting lives**, and it's one scalar per market class —
+not a matrix of source weights. Data sources don't get weighted individually; a model
+combines them into one probability, and *that* gets weighted against the market's. Today
+`w = 0` everywhere, because the model measured worse than predicting 0.5.
+
+**The amber box is a chain, not a blend.** Each layer conditions on the one above:
+multiplication, not averaging. A player 30% likely to be active has his whole
+distribution scaled by 0.30 — he isn't "weighted down". Layer 0 is where the measured
+injury signal applies, and it's the identified blocker: bust probability is currently a
+player constant, and it isn't one.
+
+**Timeline:** period and prop prices first arrive **6 September**, 72 hours before the
+Week 1 opener, because those tiers only poll inside that window. Nothing in the amber box
+can be validated before then.
+
 ### Where the LLM sits — and where it deliberately doesn't
 
 One place only: a **red-team agent that can downgrade a pick and never upgrade one.**
