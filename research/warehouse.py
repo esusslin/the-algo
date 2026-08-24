@@ -221,6 +221,10 @@ def build(verbose: bool = True) -> dict:
         ("nextgen_stats", "ngs", "ngs_*.parquet"),
         ("stats_player", "stats_player", "stats_player_week_*.parquet"),
         ("injuries", "injuries_hist", "injuries_*.parquet"),
+        # The identity table. Absent until now, which is why `practice_signal.py`
+        # crashed reaching for `players` and fell back to deriving `active` from
+        # touches — a measure that counts a blocking tight end as inactive.
+        ("players", "players", "players.parquet"),
     ]:
         src = _glob(tag, pattern)
         if not src:
@@ -233,6 +237,49 @@ def build(verbose: bool = True) -> dict:
         except Exception as exc:  # noqa: BLE001
             log.warning("%s unreadable: %s", view, exc)
             missing.append(tag)
+
+    # ---- pfr -> gsis crosswalk ----
+    #
+    # **Why this is a table and not an inline join.** `snap_counts` keys on
+    # `pfr_player_id`; everything else in the warehouse keys on gsis. Without a bridge,
+    # snap share — the most direct measure of whether a player was actually on the field
+    # — cannot be joined to injuries, targets, or ratings. `practice_signal.py` worked
+    # around it by deriving `active` from touches, which counts a blocking tight end or
+    # a backup quarterback as inactive, and that caveat is currently attached to the
+    # only measured result the project has.
+    #
+    # Built as a table rather than a view so the coverage number is computed once and
+    # can be asserted in `verify()`. A crosswalk whose coverage nobody measures is a
+    # silent-partial-join waiting to happen: rows vanish from the result and the query
+    # still succeeds.
+    if "players" in built:
+        con.execute("""
+            CREATE OR REPLACE TABLE pfr_gsis AS
+            SELECT
+                pfr_id   AS pfr_player_id,
+                gsis_id  AS player_id,
+                display_name,
+                position
+            FROM players
+            WHERE pfr_id IS NOT NULL AND pfr_id <> ''
+              AND gsis_id IS NOT NULL AND gsis_id <> ''
+        """)
+        built["pfr_gsis"] = con.execute("SELECT COUNT(*) FROM pfr_gsis").fetchone()[0]
+
+        # One pfr_id must not map to two gsis ids. If it does, any join through this
+        # table silently duplicates rows — which inflates snap counts rather than
+        # failing, and is the kind of error that shows up as a suspiciously good model.
+        dupes = con.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT pfr_player_id FROM pfr_gsis
+                GROUP BY pfr_player_id HAVING COUNT(DISTINCT player_id) > 1
+            )
+        """).fetchone()[0]
+        built["pfr_gsis_ambiguous"] = dupes
+        if dupes:
+            log.warning("pfr_gsis: %d pfr_ids map to multiple gsis ids", dupes)
+    else:
+        missing.append("pfr_gsis")
 
     con.execute("CREATE INDEX IF NOT EXISTS idx_tw ON team_weeks(season, week, team)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_pw ON player_weeks(season, week, player_id)")
@@ -263,6 +310,28 @@ def verify() -> list[str]:
           f"{max(n for _, n in per_season):,}")
     if thin:
         problems.append(f"suspiciously thin seasons: {', '.join(thin)}")
+
+    # The crosswalk has to actually cover the snap table, or joining through it drops
+    # players silently. A partial join doesn't fail — it returns fewer rows and the
+    # query looks fine, which is how "snap share" quietly becomes "snap share, for the
+    # subset of players we happened to have IDs for".
+    try:
+        cw = con.execute("""
+            SELECT
+                COUNT(DISTINCT s.pfr_player_id)                                  AS snap_ids,
+                COUNT(DISTINCT CASE WHEN x.player_id IS NOT NULL
+                                    THEN s.pfr_player_id END)                    AS matched
+            FROM snaps s LEFT JOIN pfr_gsis x USING (pfr_player_id)
+        """).fetchone()
+        rate = cw[1] / cw[0] if cw[0] else 0.0
+        print(f"  pfr->gsis      : {cw[1]:,}/{cw[0]:,} snap ids matched ({rate:.1%})")
+        if rate < 0.90:
+            problems.append(
+                f"pfr->gsis covers only {rate:.1%} of snap_counts ids — "
+                "joins through it will drop players"
+            )
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"pfr_gsis or snaps unavailable: {exc}")
 
     # EPA should centre near zero league-wide — if it doesn't, the filter is wrong
     mean_epa = con.execute("SELECT AVG(epa) FROM plays").fetchone()[0]

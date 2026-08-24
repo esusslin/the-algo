@@ -227,19 +227,39 @@ def load(con, verbose: bool = True) -> pd.DataFrame:
     # blocking tight end or a backup quarterback plays a full game and records zero.
     # That mismeasurement is the likely reason the first probe showed Limited players
     # apparently *more* active than Full ones.
+    # **The join used to be impossible, not merely absent.** `snap_counts` keys on
+    # `pfr_player_id` and everything else here keys on gsis, so the old code either
+    # refused the join (correctly) or would have compared PFR ids to gsis ids and
+    # matched nothing while reporting success. `pfr_gsis` in the warehouse bridges them
+    # at 99.6% of snap ids, with zero one-to-many mappings — which matters, because a
+    # one-to-many crosswalk duplicates rows instead of failing and inflates snap counts.
     snap_cols = _columns(con, "snaps") if _has_table(con, "snaps") else set()
     pct = next((c for c in ("offense_pct", "offense_snaps_pct") if c in snap_cols), None)
-    pid = next((c for c in ("pfr_player_id", "player_id", "gsis_id") if c in snap_cols), None)
+    native = next((c for c in ("player_id", "gsis_id") if c in snap_cols), None)
+    via_pfr = "pfr_player_id" in snap_cols and _has_table(con, "pfr_gsis")
+
     frame["snap_pct"] = np.nan
-    if pct and pid and pid in {"player_id", "gsis_id"}:
-        snaps = con.execute(
-            f"SELECT season, week, {pid} AS player_id, {pct} AS snap_pct FROM snaps"
-        ).df()
+    query = None
+    if pct and native:
+        query = f"SELECT season, week, {native} AS player_id, {pct} AS snap_pct FROM snaps"
+    elif pct and via_pfr:
+        # INNER join on the crosswalk on purpose: an unmatched pfr id yields no snap
+        # row, which becomes a NaN and then `active = 0` — indistinguishable from a
+        # healthy scratch. Better to have no snap number for those players and let the
+        # coverage print say so.
+        query = f"""
+            SELECT s.season, s.week, x.player_id AS player_id, s.{pct} AS snap_pct
+            FROM snaps s JOIN pfr_gsis x ON s.pfr_player_id = x.pfr_player_id
+        """
+
+    if query:
+        snaps = con.execute(query).df()
         frame = frame.drop(columns=["snap_pct"]).merge(
             snaps, on=["season", "week", "player_id"], how="left"
         )
         if verbose:
-            print(f"  snap coverage: {frame['snap_pct'].notna().mean():.1%}")
+            route = "native gsis" if native else "via pfr_gsis crosswalk"
+            print(f"  snap coverage: {frame['snap_pct'].notna().mean():.1%} ({route})")
     elif verbose:
         print("  no joinable snap counts — falling back to touches for `active`")
 
@@ -270,9 +290,35 @@ def load(con, verbose: bool = True) -> pd.DataFrame:
     # Those are indistinguishable here and both score zero on a prop, which is the
     # quantity that actually matters.
     frame["usage_share"] = frame["usage_share"].fillna(0.0)
-    if frame["snap_pct"].notna().mean() > 0.5:
+
+    # **Restrict to the snap era before switching, or the fix is worse than the bug.**
+    # `snap_counts` starts in 2013; `injuries_hist` starts in 2009. Inside the snap era
+    # a missing snap row means "took no snaps", which is exactly what we want. Outside
+    # it, a missing row means "this data does not exist" — and `fillna(0) > 0` cannot
+    # tell those apart, so four seasons of players would silently be marked inactive.
+    #
+    # Rather than mix two definitions of `active` in one panel, drop the pre-era rows
+    # and say how many. Fewer rows measured honestly beats more rows measured two
+    # different ways, and a walk-forward split would otherwise train on one definition
+    # and test on another.
+    snap_seasons = frame.loc[frame["snap_pct"].notna(), "season"]
+    if not snap_seasons.empty:
+        first_snap_season = int(snap_seasons.min())
+        in_era = frame["season"] >= first_snap_season
+        era_coverage = frame.loc[in_era, "snap_pct"].notna().mean()
+    else:
+        first_snap_season, in_era, era_coverage = None, None, 0.0
+
+    if first_snap_season is not None and era_coverage > 0.5:
+        dropped = int((~in_era).sum())
+        frame = frame[in_era].copy()
         frame["active"] = (frame["snap_pct"].fillna(0) > 0).astype(int)
-        frame.attrs["active_source"] = "snap counts"
+        frame.attrs["active_source"] = f"snap counts ({first_snap_season}+)"
+        if verbose and dropped:
+            print(
+                f"  dropped {dropped:,} pre-{first_snap_season} rows: snap counts don't "
+                "exist there, and touches would be a different definition of `active`"
+            )
     else:
         frame["active"] = (frame["usage_share"] > 0).astype(int)
         frame.attrs["active_source"] = "touches (weak proxy — no snap join available)"
@@ -340,7 +386,25 @@ def _design(frame: pd.DataFrame, with_practice: bool) -> np.ndarray:
         blocks.append(_dummies(frame["practice_code"], PRACTICE_CODES))
         blocks.append(frame[["has_practice"]].to_numpy(float))
     matrix = np.hstack(blocks)
-    return np.hstack([np.ones((len(matrix), 1)), matrix])
+    design = np.hstack([np.ones((len(matrix), 1)), matrix])
+
+    # **Assert finiteness rather than inferring it from warnings.**
+    #
+    # A run of this file emits `RuntimeWarning: divide by zero / overflow / invalid
+    # value encountered in matmul` on macOS. Those are raised by the BLAS backend, not
+    # by the data — every metric came out finite, which a matrix containing inf could
+    # not produce. But "the output looked fine" is exactly the reasoning that let three
+    # earlier bugs in this file survive, so the check is cheap and explicit instead.
+    #
+    # If this ever fires, the numbers below are meaningless and the run should stop.
+    if not np.isfinite(design).all():
+        bad = np.argwhere(~np.isfinite(design))
+        raise SystemExit(
+            f"design matrix has {len(bad)} non-finite entries "
+            f"(first at row {bad[0][0]}, column {bad[0][1]}) — "
+            "every metric downstream is unusable"
+        )
+    return design
 
 
 def fit_logistic(x: np.ndarray, y: np.ndarray, iters: int = 60, ridge: float = 1.0) -> np.ndarray:
