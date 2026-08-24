@@ -114,6 +114,22 @@ def _health_heartbeat() -> None:
 
 
 # Jobs registered now; the rest land as their modules are built (see build calendar).
+GAME_DAYS = "wed,thu,fri,sat,sun,mon"
+"""Every weekday the league actually plays on.
+
+This used to read `thu,sat,sun,mon`, which is the Sunday-plus-primetime mental model
+and misses real slates. In 2026 both Black Friday (27 Nov) and Christmas (25 Dec) fall
+on a **Friday**; the league has also played Wednesday (Christmas 2024). Only Tuesday is
+genuinely never used, and even that has happened after weather postponements.
+
+Named rather than repeated so the gameday jobs can't drift apart — and generous on
+purpose. A cron entry that fires on a day with no games costs one no-op query. A
+missing one costs a whole slate: picks and closing lines would still be captured (both
+are interval jobs and event-driven), but live scores and hourly weather would silently
+not happen. `fetch_live` isn't in EXPECTED_FRESHNESS either, so /health wouldn't say a
+word — the live page would just be blank.
+"""
+
 JOBS: list[tuple] = [
     # (func, trigger, kwargs, id)
     (_refresh_nflverse, "cron", dict(day_of_week="tue", hour=7, minute=0), "refresh_nflverse_tue"),
@@ -127,7 +143,7 @@ JOBS: list[tuple] = [
     # Weather: 4x daily normally, hourly on game days when forecasts move and
     # books are slow to reprice totals.
     (_refresh_weather, "cron", dict(hour="2,8,14,20", minute=15), "refresh_weather"),
-    (_refresh_weather, "cron", dict(day_of_week="thu,sat,sun,mon", hour="*",
+    (_refresh_weather, "cron", dict(day_of_week=GAME_DAYS, hour="*",
                                     minute=15), "refresh_weather_gameday"),
 
     # Closing lines: every 5 min so staggered kickoffs are all captured in the
@@ -135,7 +151,7 @@ JOBS: list[tuple] = [
     (_capture_closing, "interval", dict(minutes=5), "capture_closing_lines"),
 
     # Live scores while games are in progress.
-    (_fetch_live, "cron", dict(day_of_week="thu,sat,sun,mon", hour="12-23",
+    (_fetch_live, "cron", dict(day_of_week=GAME_DAYS, hour="12-23",
                                minute="*/2"), "fetch_live"),
 
     # Grading: after the late window each night, then again next morning to
@@ -155,6 +171,11 @@ EXPECTED_FRESHNESS = {
     "grade_picks": timedelta(days=2),
     "refresh_injuries": timedelta(days=8),
     "refresh_nflverse": timedelta(days=9),
+    # 8 days because it only runs on game days — in season there's a slate at least
+    # weekly, so a longer gap than that means the job isn't firing. It was absent from
+    # this table entirely, which is why a day-of-week gate that skipped Friday games
+    # would have shown up as a blank live page and nothing else.
+    "fetch_live": timedelta(days=8),
 }
 
 # A job that has never run is only "degraded" once the process has been up long
