@@ -84,8 +84,34 @@ FEATURES: list[Feature] = [
     Feature("net_edge", "float", 0.0, "pregame", "overall home minus away advantage", group="matchup"),
     Feature("ratings_confident", "bool", False, "pregame", "both teams past the small-sample threshold", group="matchup"),
 
-    # ---- availability (populated once the injury feed is proven) ----
-    # Feature("home_qb_is_starter", ...), Feature("home_missing_value", ...), ...
+    # ---- availability ----
+    #
+    # The feed is now proven: `research/practice_signal.py` measured practice status at
+    # +0.054 AUC on the Questionable panel across 90,467 rows, walk-forward by season.
+    # These are the *team-level* consequence of that — not "is this player playing" but
+    # "how much of this team isn't".
+    #
+    # **`missing_snap_share` is the one that should matter.** Counting bodies treats a
+    # third-string safety and a left tackle alike. Weighting each unavailable player by
+    # the offensive snap share he took over the previous four weeks measures what the
+    # team actually loses. It exists only because the pfr→gsis crosswalk landed — snap
+    # counts key on `pfr_player_id` and everything else keys on gsis.
+    #
+    # **Availability window: 2009+ for the counts, 2013+ for snap share.** Before those
+    # years the data does not exist and the features are zero — which a model can learn
+    # as an era marker rather than as a fact about injuries. `availability_known` exists
+    # so that's explicit rather than inferred, and `research/train.py` compares a 2013+
+    # baseline against a 2013+ availability model so the era effect and the feature
+    # effect can't be confused.
+    Feature("home_out_count", "int", 0, "pregame", "players ruled Out", group="availability"),
+    Feature("away_out_count", "int", 0, "pregame", "players ruled Out", group="availability"),
+    Feature("home_questionable_count", "int", 0, "pregame", "players Questionable", group="availability"),
+    Feature("away_questionable_count", "int", 0, "pregame", "players Questionable", group="availability"),
+    Feature("home_qb_out", "bool", False, "pregame", "a quarterback is Out", group="availability"),
+    Feature("away_qb_out", "bool", False, "pregame", "a quarterback is Out", group="availability"),
+    Feature("home_missing_snap_share", "float", 0.0, "pregame", "sum of prior-4wk offensive snap share of players Out", group="availability"),
+    Feature("away_missing_snap_share", "float", 0.0, "pregame", "sum of prior-4wk offensive snap share of players Out", group="availability"),
+    Feature("availability_known", "bool", False, "pregame", "injury and snap data exist for this season", group="availability"),
 ]
 
 FEATURE_NAMES: list[str] = [f.name for f in FEATURES]

@@ -53,6 +53,88 @@ def _ratings_index() -> dict[tuple, dict]:
             for r in rows}
 
 
+FIRST_INJURY_SEASON = 2009
+FIRST_SNAP_SEASON = 2013
+
+
+def _availability_index() -> dict[tuple, dict]:
+    """(season, week, team) -> availability summary, from the injury report.
+
+    **Point-in-time by construction, with one caveat stated plainly.** `injuries_hist`
+    carries `date_modified`, but the join here is on (season, week), which means a row
+    that was updated late in the week is used for the whole week. For a *pregame* feature
+    that is the right granularity — the final report is what's knowable before kickoff —
+    but it would be wrong for anything intra-week, and `Omaha` exists precisely to make
+    the intra-week trajectory available.
+
+    `missing_snap_share` weights each unavailable player by the offensive snap share he
+    took over the previous four weeks, so losing a left tackle is not scored the same as
+    losing a third-string safety. The window is `4 PRECEDING TO 1 PRECEDING` — the current
+    week is excluded, or the feature would contain the outcome it's meant to predict.
+
+    Reachable only because of `pfr_gsis`: snap counts key on `pfr_player_id` and injuries
+    key on gsis, and before the crosswalk existed these two tables could not be joined at
+    all.
+    """
+    con = connect(read_only=True)
+    try:
+        # **Range join, not a window lookup.** The first version computed a rolling mean
+        # keyed on (player, season, week) and joined it at the injury row's own week —
+        # but a player who is Out has no snap row that week, so it matched only players
+        # who played. `missing_snap_share` came out zero for essentially every row while
+        # the query succeeded and the column looked populated.
+        #
+        # Joining `s.week BETWEEN i.week - 4 AND i.week - 1` asks the right question:
+        # what was this player's snap share in the four weeks *before* the week he's
+        # listed for. It also excludes the current week by construction, so the feature
+        # cannot contain the outcome it predicts.
+        con.execute("""
+            CREATE OR REPLACE TEMP VIEW _snap_prior AS
+            SELECT i.season, i.week, i.gsis_id,
+                   AVG(s.offense_pct) AS prior_snap_pct
+            FROM injuries_hist i
+            JOIN pfr_gsis x ON x.player_id = i.gsis_id
+            JOIN snaps s
+              ON s.pfr_player_id = x.pfr_player_id
+             AND s.season = CAST(i.season AS INTEGER)
+             AND s.week BETWEEN CAST(i.week AS INTEGER) - 4 AND CAST(i.week AS INTEGER) - 1
+            GROUP BY 1, 2, 3
+        """)
+        rows = con.execute("""
+            SELECT
+                CAST(i.season AS INTEGER) AS season,
+                CAST(i.week   AS INTEGER) AS week,
+                i.team,
+                COUNT(*) FILTER (WHERE i.report_status = 'Out')          AS out_count,
+                COUNT(*) FILTER (WHERE i.report_status = 'Questionable') AS q_count,
+                MAX(CASE WHEN i.report_status = 'Out' AND i.position = 'QB'
+                         THEN 1 ELSE 0 END)                              AS qb_out,
+                COALESCE(SUM(CASE WHEN i.report_status = 'Out'
+                                  THEN p.prior_snap_pct END), 0.0)       AS missing_snap_share
+            FROM injuries_hist i
+            LEFT JOIN _snap_prior p
+                   ON p.season = i.season AND p.week = i.week AND p.gsis_id = i.gsis_id
+            -- `season_type` is NULL on 84,684 of 90,752 rows: filtering on = 'REG'
+            -- silently keeps 6% of the table. This trap has been fallen into once.
+            WHERE (i.season_type IS NULL OR i.season_type = 'REG')
+              AND i.week IS NOT NULL AND i.team IS NOT NULL
+            GROUP BY 1, 2, 3
+        """).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.error("availability unavailable (%s) — run `python -m research.warehouse build`", exc)
+        return {}
+    finally:
+        con.close()
+
+    return {
+        (r[0], r[1], r[2]): {
+            "out": int(r[3] or 0), "questionable": int(r[4] or 0),
+            "qb_out": bool(r[5]), "missing_snap_share": float(r[6] or 0.0),
+        }
+        for r in rows
+    }
+
+
 def _slot(kickoff: str | None) -> str:
     if not kickoff or len(kickoff) < 13:
         return "sun_early"
@@ -68,7 +150,8 @@ def _slot(kickoff: str | None) -> str:
 
 
 def build_matrix(seasons: list[int] | None = None,
-                 require_market: bool = True) -> dict[str, Any]:
+                 require_market: bool = True,
+                 with_availability: bool = True) -> dict[str, Any]:
     """Assemble the training matrix.
 
     Returns X (n × features), several targets, and metadata for walk-forward.
@@ -82,6 +165,12 @@ def build_matrix(seasons: list[int] | None = None,
     """
     games = _games(seasons)
     ratings = _ratings_index()
+    # `with_availability=False` zeroes the block rather than dropping the columns, so both
+    # arms of the comparison have identical shape and column order. Dropping columns
+    # instead would change the design matrix width between arms, and misaligned columns
+    # are how a useless feature ends up looking actively destructive — a mistake already
+    # made once, in `research/practice_signal.py`.
+    availability = _availability_index() if with_availability else {}
     if not games:
         raise SystemExit("no completed games — run `python -m src.fetchers.nflverse games`")
 
@@ -100,6 +189,10 @@ def build_matrix(seasons: list[int] | None = None,
         def r(team: str, cls: str) -> dict:
             return ratings.get((s, w, team, cls), {"off": 0.0, "def": 0.0,
                                                    "confident": False})
+
+        blank = {"out": 0, "questionable": 0, "qb_out": False, "missing_snap_share": 0.0}
+        hav = availability.get((s, w, h), blank)
+        aav = availability.get((s, w, a), blank)
 
         ha, aa = r(h, "all"), r(a, "all")
         hp, ap = r(h, "pass"), r(a, "pass")
@@ -133,6 +226,16 @@ def build_matrix(seasons: list[int] | None = None,
             "away_off_pass": ap["off"], "away_def_pass": ap["def"],
             "home_off_rush": hr["off"], "home_def_rush": hr["def"],
             "away_off_rush": ar["off"], "away_def_rush": ar["def"],
+            # availability — see _availability_index for the point-in-time caveat
+            "home_out_count": hav["out"],
+            "away_out_count": aav["out"],
+            "home_questionable_count": hav["questionable"],
+            "away_questionable_count": aav["questionable"],
+            "home_qb_out": hav["qb_out"],
+            "away_qb_out": aav["qb_out"],
+            "home_missing_snap_share": hav["missing_snap_share"],
+            "away_missing_snap_share": aav["missing_snap_share"],
+            "availability_known": with_availability and (s or 0) >= FIRST_SNAP_SEASON,
             # matchup: unit vs unit
             "home_pass_edge": hp["off"] - ap["def"],
             "away_pass_edge": ap["off"] - hp["def"],

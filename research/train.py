@@ -139,7 +139,8 @@ def _fit_gbm(Xtr, ytr, Xte, seed: int = 0):
 
 
 def train_residual(target: str = "spread", min_train_seasons: int = 5,
-                   from_season: int | None = None) -> TrainResult:
+                   from_season: int | None = None,
+                   with_availability: bool = True) -> TrainResult:
     """Walk-forward train and evaluate the residual model against the market."""
     seasons_filter = None
     if from_season:
@@ -148,7 +149,7 @@ def train_residual(target: str = "spread", min_train_seasons: int = 5,
             "SELECT DISTINCT season FROM games WHERE season >= ? ORDER BY 1",
             (from_season,))]
 
-    d = build_matrix(seasons_filter)
+    d = build_matrix(seasons_filter, with_availability=with_availability)
     X, names = d["X"], d["names"]
     seasons = d["seasons"]
 
@@ -286,9 +287,12 @@ if __name__ == "__main__":
     p.add_argument("target", choices=["spread", "total", "both"], nargs="?", default="both")
     p.add_argument("--from-season", type=int, default=None)
     p.add_argument("--min-train", type=int, default=5)
+    p.add_argument("--no-availability", action="store_true",
+                   help="zero the injury block — the baseline arm of the comparison")
     args = p.parse_args()
 
     targets = ["spread", "total"] if args.target == "both" else [args.target]
     for t in targets:
         report(train_residual(t, min_train_seasons=args.min_train,
-                              from_season=args.from_season))
+                              from_season=args.from_season,
+                              with_availability=not args.no_availability))

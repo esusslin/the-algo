@@ -263,6 +263,31 @@ notebook to a hedge fund, and the difference matters.
 
 - **50.0% against the closing spread.** Real result, narrow scope — team strength, rest
   and venue only. Not a statement about weather, injuries or microstructure.
+
+- **Injuries do not help full-game spreads.** Measured 24 Aug 2026 as a controlled A/B:
+  same seasons, same rows, identical design-matrix width, with the availability block
+  zeroed rather than dropped so column order couldn't drift.
+
+  | arm | Brier | Δ vs always-0.5 | cover accuracy |
+  |---|---|---|---|
+  | baseline | 0.2562 | −0.0062 | 48.4% |
+  | **+ availability** | 0.2563 | −0.0063 | 48.1% |
+  | market | — | — | **52.7%** |
+
+  Eight new features — counts Out and Questionable, QB out, and prior-4-week snap share
+  of unavailable players — moved Brier by **0.0001** and accuracy by **−0.3pp**. Noise.
+  The model remains worse than predicting 0.5 for everything.
+
+  **This was the expected result and the repo said so before the run.** Books read the
+  same injury report hours earlier; a closing line that didn't price it would be the
+  surprise. The measurement's value is that it converts an assumption into a number and
+  closes off a direction that looked obviously worth pursuing.
+
+  **It does not mean the injury work was wasted — it means it was aimed at the wrong
+  market.** `research/practice_signal.py` measured +0.054 AUC on `P(player is active)`,
+  which is a *prop* input, not a spread input. A quarterback ruled out moves a spread the
+  market has already moved; whether a questionable receiver takes the field decides
+  whether his receptions prop settles at zero.
 - **Practice participation carries signal.** +0.054 AUC on the Questionable panel across
   90,467 injury rows, walk-forward by season. Measured *before* building the pipeline that
   would use it.
@@ -271,9 +296,13 @@ notebook to a hedge fund, and the difference matters.
 
 | | what | why it isn't done |
 |---|---|---|
-| 1 | **A retrain that includes what's now available** | Injuries (5,299 rows live, signal measured at +0.054 AUC), weather (from 30 Aug), and market microstructure (78 distinct line-movement timestamps across three weeks — see the correction in `DATA_INVENTORY.md` §5). Three of the nine pinned features have data today. **This decides everything below it**: if the null result holds with a wider feature set, the model shouldn't ship at all. |
-| 2 | **A serving-side feature path** | The blocker nobody had named. `research/features.py` builds vectors from DuckDB; nothing in `src/` builds one, so `model_prob` is never computed and `blended_probability` degrades to market-only by design. Only worth building if item 1 moves the number. |
-| 3 | **Blend-weight adaptation from CLV** | `w` is fit once offline; it should drift weekly from measured closing-line value, capped at ±0.02/week, floored at 30 picks, bounded to [0, 0.6]. Needs live picks *and* items 1–2. |
+| 1 | **The prop engine's serving path** | Now the top item, on evidence rather than plan. `research/props.py` has distributional projections and a hurdle model; there is no route from those to a published pick. This is where the measured injury signal actually applies — `P(active)` is a prop input. |
+| 2 | **Period and prop market coverage** | `odds_current` carries h2h, spreads and totals only. The `period` and `props` polling tiers exist and fire within 72h of kickoff, so first real data arrives **6 Sept**. |
+| 3 | **Blend-weight adaptation from CLV** | `w` should drift weekly from measured closing-line value, capped at ±0.02/week, floored at 30 picks, bounded to [0, 0.6]. Needs live picks in a market where a model is actually running. |
+
+**Deliberately not on this list:** a serving-side feature path for full-game spreads. It
+was item 2 until the A/B above; there is no point wiring a model into production that is
+measurably worse than predicting 0.5.
 | 5 | **Prop engine** | Distributional projections and the hurdle model exist in `research/props.py`; the serving path and 1H markets don't. |
 | 6 | **QB-conditional ratings** | A backup start currently corrupts a team's rating for weeks. Needs the injury feed above. |
 | 7 | **State-space team ratings** | The principled answer to mid-season regime change. Ridge + recency weighting is the stopgap. |
