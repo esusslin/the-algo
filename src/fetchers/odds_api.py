@@ -135,7 +135,10 @@ class CreditLedger:
     """
 
     def __init__(self, budget: int | None = None):
-        self.budget = budget or settings.ODDS_MONTHLY_CREDIT_BUDGET
+        # `budget or settings...` was wrong: `0 or X` is `X`, so an explicit budget of
+        # zero — the obvious way to halt spending — silently restored the full default.
+        # A kill switch that does the opposite of killing is worse than no kill switch.
+        self.budget = budget if budget is not None else settings.ODDS_MONTHLY_CREDIT_BUDGET
 
     def used_this_month(self) -> int:
         first = datetime.now(timezone.utc).replace(
