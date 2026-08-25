@@ -3,7 +3,7 @@
 NFL betting model + pick engine. Multi-model predictions across sides, totals, derivatives,
 and player props, with market-relative edge detection and CLV tracking.
 
-> **Status: work in progress, and honest about it.**
+> **Status: work in progress.**
 >
 > **What runs in production today is a market engine, not a model.** Picks come from
 > devigged consensus fair prices shopped against 23 books — line shopping, which is a real
@@ -20,6 +20,47 @@ and player props, with market-relative edge detection and CLV tracking.
 > as a claim.
 
 ---
+
+## What goes into a pick
+
+Six layers. Each one consumes the one below it, and **only the top three currently reach
+a published pick.**
+
+```mermaid
+flowchart TB
+    L5["<b>5 · DECISION</b><br/>tier assignment · fractional Kelly with correlation haircuts<br/>red-team veto, downgrade only<br/><i>publishes</i>"]
+    L4["<b>4 · EDGE</b><br/>best available price vs consensus fair price<br/><i>this is the entire signal today</i>"]
+    L3["<b>3 · CONSENSUS</b><br/>devig every book — 4 methods · weighted median<br/>anchored on sharp books"]
+    L2["<b>2 · MARKET</b><br/>23 books · h2h, spreads, totals · kickoff-aware polling<br/>period and prop tiers fire inside 72h"]
+    L1["<b>1 · CONTEXT</b><br/>injuries · weather · line movement · rest, venue, schedule<br/><i>feeds the red team — not the price</i>"]
+    L0["<b>0 · FOUNDATION</b><br/>1.28M plays · 476k player-weeks · 325k snap counts<br/>opponent-adjusted unit ratings, point-in-time<br/><i>research plane only — never priced a live pick</i>"]
+
+    L0 --> L1 --> L2 --> L3 --> L4 --> L5
+
+    style L5 fill:#1f3a1f,stroke:#40a040
+    style L4 fill:#1f3a1f,stroke:#40a040
+    style L3 fill:#1f3a1f,stroke:#40a040
+    style L2 fill:#1f3a1f,stroke:#40a040
+    style L1 fill:#3a3020,stroke:#a08040
+    style L0 fill:#3a2020,stroke:#a04040
+```
+
+| layer | what it consumes | in a live pick? |
+|---|---|---|
+| **5 · Decision** | a priced edge | ✅ |
+| **4 · Edge** | consensus fair price + every book's offer | ✅ |
+| **3 · Consensus** | 23 books' raw prices, devigged | ✅ |
+| **2 · Market** | Odds API, polled on a kickoff-aware schedule | ✅ |
+| **1 · Context** | injuries, weather, line movement, rest and venue | ⚠️ red team only |
+| **0 · Foundation** | 546 MB nflverse, 1999–2025, plus derived ratings | ❌ research only |
+
+**The short version:** a pick is a price disagreement, not a prediction. Layers 2–4 find
+books offering better than the market's own consensus; layer 5 sizes it and lets an LLM
+argue against publishing. Layer 1 informs that argument but never moves the number. Layer
+0 — the play-by-play, the ratings, the whole research plane — has never touched a
+published pick, because the model built on it measured no edge.
+
+Everything below is the detail behind those six lines.
 
 ## What it eats, and what it actually digests
 
@@ -50,7 +91,7 @@ flowchart LR
         omaha["Omaha<br/>typed injury records"]
     end
 
-    subgraph model["MODEL — 27 live features"]
+    subgraph model["MODEL — 27 features, TRAINING ONLY"]
         feats["market spread + total<br/>rest, division, dome, slot, week<br/>12 unit ratings<br/>6 matchup edges"]
     end
 
@@ -83,10 +124,13 @@ flowchart LR
 ```
 
 **Read the dotted lines.** Weather is collected four times a day and has never reached the
-model. Injuries are collected Wednesday, Thursday and Friday and have never reached the
-model. Line movement can't reach it, because `odds_changes` holds a single timestamp and
-history cannot be backfilled — those features can only be filled forward from September's
-polls.
+model. Injuries are collected Wednesday, Thursday and Friday and have never reached it
+either — and when they finally were tested, [they made no
+difference](#measured-and-negative) to full-game spreads. Line movement *is* being
+collected (78 distinct timestamps over three weeks, correcting an earlier claim in
+`DATA_INVENTORY.md` §5) and remains unused.
+
+And the model box is training-only. Nothing in it prices a live pick.
 
 | | count |
 |---|---|
@@ -143,13 +187,13 @@ flowchart TB
     subgraph feeds["WHAT FEEDS THE PROP LAYERS"]
         inj["injury + practice status<br/><i>Omaha</i>"]
         script["game script from the market<br/><i>spread magnitude, implied total</i>"]
-        call["play-calling tendency<br/><i>pbp, FTN charting</i>"]
+        tendency["play-calling tendency<br/><i>pbp, FTN charting</i>"]
         match["matchup adjustment<br/><i>NextGen, unit ratings</i>"]
     end
 
     inj --> l0
     script --> l1
-    call --> l2
+    tendency --> l2
     match --> l3
 
     edge --> blend
