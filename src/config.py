@@ -36,6 +36,41 @@ def _list(key: str, default: str = "") -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+# Strings that are present, pass a truthiness check, and mean nothing.
+#
+# `validate()` originally tested `not self.JWT_SECRET_KEY`, which the placeholder
+# shipped in `.env.example` passes cleanly — so a deploy that never rotated it would
+# start, log no problem, and sign tokens with a value published in a public repo.
+# A check that runs, succeeds and verifies nothing is worse than no check, because
+# it is also a reason not to look.
+PLACEHOLDER_MARKERS = (
+    "change_me", "changeme", "change-me", "placeholder", "todo",
+    "your_", "your-", "xxxxxx", "sk-ant-...", "<", "example.com",
+)
+# `xxxxxx` rather than `xxxx`: a real `token_urlsafe` key hits four consecutive x's
+# about once in 280,000, and a validator that occasionally refuses a perfectly good
+# secret is one somebody eventually deletes. Six makes it ~1e-9 and still catches
+# every hand-written placeholder, which run long.
+
+PROPS_MIN_BUDGET = 60_000
+"""Smallest monthly credit budget that keeps props alive for a whole month.
+
+`scripts/simulate_odds_credits.py` measures props-on burn at ~38,000/month against the
+real tier tables. `CreditLedger.allows()` drops props below 30% remaining, i.e. once
+usage passes 70% of budget — so the budget must exceed 38,000 / 0.70 = 54,300. Rounded
+up for a 17-game week and byes. Tested in `test_market_math.py` against the simulator,
+so this cannot quietly drift away from what the schedules actually cost."""
+
+MIN_SECRET_LENGTH = 32
+"""`secrets.token_urlsafe(48)` gives 64 characters. Anything much shorter was typed
+by a human, and a human-typed signing key is a guessable one."""
+
+
+def _is_placeholder(value: str) -> bool:
+    low = value.strip().lower()
+    return any(marker in low for marker in PLACEHOLDER_MARKERS)
+
+
 class Settings:
     # ---- environment ----
     ENV: str = os.getenv("ENV", "local")
@@ -113,14 +148,49 @@ class Settings:
         """
         problems: list[str] = []
         if self.IS_PROD:
+            # Order matters: absent, then present-but-meaningless, then too short.
+            # Only the first of these was ever checked, and it is the one a real
+            # deploy is least likely to hit.
             if not self.JWT_SECRET_KEY:
                 problems.append("JWT_SECRET_KEY is not set")
+            elif _is_placeholder(self.JWT_SECRET_KEY):
+                problems.append(
+                    "JWT_SECRET_KEY is still the placeholder from .env.example — it is "
+                    "published in a public repo, so anyone can forge an admin token. "
+                    'Regenerate: python -c "import secrets;print(secrets.token_urlsafe(48))"')
+            elif len(self.JWT_SECRET_KEY) < MIN_SECRET_LENGTH:
+                problems.append(
+                    f"JWT_SECRET_KEY is {len(self.JWT_SECRET_KEY)} characters; want at "
+                    f"least {MIN_SECRET_LENGTH}. Short signing keys are brute-forceable")
+
             if not self.ODDS_API_KEY:
                 problems.append("ODDS_API_KEY is not set")
+            elif _is_placeholder(self.ODDS_API_KEY):
+                problems.append("ODDS_API_KEY is a placeholder, not a key")
+
             if not self.ANTHROPIC_API_KEY:
                 problems.append("ANTHROPIC_API_KEY is not set")
+            elif _is_placeholder(self.ANTHROPIC_API_KEY):
+                # The exact shape that shipped once: `sk-ant-...` reads as configured to
+                # every truthiness check and fails on the first real call.
+                problems.append("ANTHROPIC_API_KEY is a placeholder, not a key")
             if self.ENABLE_SMS and not self.TWILIO_ACCOUNT_SID:
                 problems.append("ENABLE_SMS is true but Twilio is not configured")
+        # Props enabled against a budget that cannot sustain them for a month.
+        #
+        # Neither variable is wrong on its own, which is why this went unnoticed:
+        # ENABLE_PROPS=true is a decision, 20000 is a number, and only together do
+        # they mean "collect props for eleven days and then stop". The ledger sheds
+        # props below 30% remaining, so the budget has to clear roughly 1.43x the
+        # monthly burn; measured props-on burn is ~38,000/month.
+        if self.ENABLE_PROPS and self.ODDS_MONTHLY_CREDIT_BUDGET < PROPS_MIN_BUDGET:
+            problems.append(
+                f"ENABLE_PROPS is true but ODDS_MONTHLY_CREDIT_BUDGET is "
+                f"{self.ODDS_MONTHLY_CREDIT_BUDGET:,}. The credit ladder sheds props "
+                f"below 30% remaining, so props would stop collecting partway through "
+                f"the month while /health stayed green. Want at least "
+                f"{PROPS_MIN_BUDGET:,}, or set ENABLE_PROPS=false deliberately")
+
         if self.KELLY_FRACTION > 0.5:
             problems.append(
                 f"KELLY_FRACTION={self.KELLY_FRACTION} is dangerously high (max recommended 0.25)"

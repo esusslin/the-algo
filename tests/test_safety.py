@@ -268,6 +268,111 @@ def test_a_malformed_but_complete_response_reports_differently(monkeypatch):
         complete_json("p", agent="test")
 
 
+# ---- config validation: present is not the same as set --------------------
+#
+# `validate()` tested `not self.JWT_SECRET_KEY`. The placeholder shipped in
+# `.env.example` — `CHANGE_ME_BEFORE_DEPLOY` — passes that cleanly, so a deploy
+# that never rotated it would start, report no problems, and sign admin tokens
+# with a string published in a public repository.
+#
+# Same shape as the `sk-ant-...` bug in Omaha's `available()`: a truthiness check
+# standing in for a validity check. It is the config-file version of a green
+# pipeline over an empty pipe — the check runs, passes, and is a reason not to
+# look.
+
+
+GOOD_JWT = "Kj7_pQ2xNvR4mZ8tLwYc3HbF6dSaE9gU1oI5rTnXyVjMkB0PqAzWeD"
+"""Shaped like real `secrets.token_urlsafe(48)` output. An earlier version of this
+fixture used `"x" * 64`, which tripped the `xxxx` marker — the control test below
+caught it, and the marker was tightened to six rather than the fixture papered over."""
+
+
+def _prod_settings(monkeypatch, **overrides):
+    from src.config import Settings
+
+    s = Settings()
+    monkeypatch.setattr(s, "IS_PROD", True, raising=False)
+    for k, v in {"JWT_SECRET_KEY": GOOD_JWT, "ODDS_API_KEY": "a1b2c3d4e5f60718",
+                 "ANTHROPIC_API_KEY": "sk-ant-api03-" + "Az09_-" * 12,
+                 **overrides}.items():
+        monkeypatch.setattr(s, k, v, raising=False)
+    return s
+
+
+def test_a_good_production_config_reports_no_problems(monkeypatch):
+    """The control. Without it, a validator that flagged everything would pass
+    every test below."""
+    assert _prod_settings(monkeypatch).validate() == []
+
+
+def test_the_shipped_jwt_placeholder_is_rejected(monkeypatch):
+    """**The bug.** This exact string is in `.env.example`, in a public repo.
+
+    Asserts on the word "placeholder", not merely on the key name. The shipped
+    placeholder is 23 characters, so it also trips the length rule — meaning a
+    version of this test that only checked for "JWT_SECRET_KEY" passed even with
+    the placeholder branch deleted. Mutation testing found that; the fix is to
+    name the reason, not just the field.
+    """
+    problems = _prod_settings(
+        monkeypatch, JWT_SECRET_KEY="CHANGE_ME_BEFORE_DEPLOY").validate()
+    assert any("placeholder" in p for p in problems), problems
+
+
+def test_a_long_placeholder_is_caught_by_shape_not_by_length(monkeypatch):
+    """The case the length rule cannot reach. Long enough to look like a secret,
+    still meaningless — this is what the marker list is actually for."""
+    problems = _prod_settings(
+        monkeypatch, JWT_SECRET_KEY="CHANGE_ME_BEFORE_DEPLOY_" + "0" * 48).validate()
+    assert any("placeholder" in p for p in problems), problems
+
+
+def test_the_jwt_message_says_how_to_fix_it(monkeypatch):
+    """A validator that reports a problem without the remedy gets ignored once and
+    then forever."""
+    problems = _prod_settings(
+        monkeypatch, JWT_SECRET_KEY="CHANGE_ME_BEFORE_DEPLOY").validate()
+    assert any("token_urlsafe" in p for p in problems)
+
+
+def test_a_short_jwt_secret_is_rejected(monkeypatch):
+    """Not a placeholder, just weak — a human typed it."""
+    problems = _prod_settings(monkeypatch, JWT_SECRET_KEY="hunter2").validate()
+    assert any("JWT_SECRET_KEY" in p for p in problems)
+
+
+def test_an_empty_jwt_secret_is_still_rejected(monkeypatch):
+    """The original check must survive the new ones."""
+    problems = _prod_settings(monkeypatch, JWT_SECRET_KEY="").validate()
+    assert any("not set" in p for p in problems)
+
+
+def test_the_anthropic_placeholder_shape_is_rejected(monkeypatch):
+    """`sk-ant-...` reads as configured to every truthiness check and fails on the
+    first real call. This shipped once already."""
+    problems = _prod_settings(monkeypatch, ANTHROPIC_API_KEY="sk-ant-...").validate()
+    assert any("ANTHROPIC_API_KEY" in p for p in problems)
+
+
+def test_a_real_looking_anthropic_key_passes(monkeypatch):
+    """The false-positive guard. Real keys start `sk-ant-api03-`, and a validator
+    that rejected them would be disabled within a day."""
+    real = "sk-ant-api03-" + "Az09_-" * 12
+    assert not any("ANTHROPIC" in p for p in
+                   _prod_settings(monkeypatch, ANTHROPIC_API_KEY=real).validate())
+
+
+def test_placeholders_are_ignored_outside_production(monkeypatch):
+    """Local dev runs on placeholders by design. Failing there would train everyone
+    to ignore the output, which is how the production check got missed."""
+    from src.config import Settings
+
+    s = Settings()
+    monkeypatch.setattr(s, "IS_PROD", False, raising=False)
+    monkeypatch.setattr(s, "JWT_SECRET_KEY", "CHANGE_ME_BEFORE_DEPLOY", raising=False)
+    assert not any("JWT_SECRET_KEY" in p for p in s.validate())
+
+
 # ---- team crosswalk ------------------------------------------------------
 def test_all_teams_resolve_from_full_name():
     for t in TEAMS:

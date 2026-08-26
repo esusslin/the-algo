@@ -282,6 +282,38 @@ def health() -> JSONResponse:
         for r in query("SELECT source, last_success, detail FROM source_freshness")
     }
 
+    # Credit ledger. Reported because it degrades *silently* — `allows()` sheds
+    # props below 30% remaining, period below 15%, everything but featured below
+    # 5%, and until now nothing announced any of it. A tier stops collecting, the
+    # jobs above keep succeeding, and /health stays green: the pipeline is fine,
+    # the pipe is empty.
+    #
+    # This is measured against ODDS_MONTHLY_CREDIT_BUDGET, which is a config value
+    # and not the real plan. On 25 Aug the two had drifted — .env carried 20,000
+    # after the plan went to 100,000 — so the number is echoed here rather than
+    # only the percentage. A budget that looks wrong to a human reading this is
+    # the point.
+    try:
+        from src.fetchers.odds_api import CreditLedger
+
+        _ledger = CreditLedger()
+        _pct = _ledger.remaining_pct()
+        shed = [t for t in ("featured", "period", "props") if not _ledger.allows(t)]
+        credits = {
+            "budget": _ledger.budget,
+            "used_this_month": _ledger.used_this_month(),
+            "remaining_pct": round(_pct, 1),
+            "tiers_shed": shed,
+        }
+    except Exception as exc:  # noqa: BLE001 — health must never 500 on a sub-check
+        credits = {"error": f"{type(exc).__name__}: {exc}"}
+        shed = []
+
+    # A shed tier is degraded data, exactly like a stale job. Naming it here is
+    # what turns "props stopped collecting eleven days in" from something you
+    # discover in December into something you see the day it happens.
+    degraded.extend(f"credits:{t}" for t in shed)
+
     # Liveness (does Railway keep this container?) is deliberately looser than
     # health (should a human look at this?). A stale data job means degraded
     # data, not a dead process — restarting the container would not fix it and
@@ -298,6 +330,7 @@ def health() -> JSONResponse:
             "degraded": degraded,
             "jobs": jobs,
             "sources": sources,
+            "credits": credits,
             "flags": {
                 "publish_model_picks": settings.PUBLISH_MODEL_PICKS,
                 "props": settings.ENABLE_PROPS,

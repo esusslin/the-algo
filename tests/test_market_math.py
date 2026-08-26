@@ -21,6 +21,8 @@ Everything here is pure or patched. No network, no database, no API key.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from src.fetchers.odds_api import CreditLedger, PollTier
@@ -289,3 +291,118 @@ def test_the_ladder_is_monotonic(monkeypatch: pytest.MonkeyPatch) -> None:
         seen.append((led.allows("featured"), led.allows("period"), led.allows("props")))
     for earlier, later in zip(seen, seen[1:]):  # offset pairs — lengths differ by one
         assert all(l <= e for e, l in zip(earlier, later, strict=True)), (earlier, later)
+
+
+# --- the budget must be able to pay for the schedules -------------------------------
+#
+# `CreditLedger` degrades against `ODDS_MONTHLY_CREDIT_BUDGET`, not against the real
+# Odds API plan. Nothing previously connected the two, and on 25 Aug they had drifted:
+# `.env` still carried 20,000 from before the plan was upgraded to 100,000, while the
+# corrected schedules cost ~38,000/month.
+#
+# The consequence is not an overspend — it is the opposite, and worse for being quiet.
+# The ladder sheds props below 30% remaining, which against a 20,000 budget arrives at
+# 14,000 credits: roughly ten days in. Props would collect for a week and a half and
+# then stop, with real plan usage barely a seventh consumed and /health green
+# throughout. A green pipeline over an empty pipe, pre-loaded for Week 1.
+#
+# These tests tie the config to the simulator so a plan change and a config change
+# cannot drift apart again.
+
+
+def _simulated_monthly_credits(*, games: int = 16, props: bool = True) -> float:
+    from scripts.simulate_odds_credits import simulate_week, typical_week
+
+    kickoffs = typical_week(datetime(2026, 9, 13, tzinfo=timezone.utc))
+    kickoffs += [kickoffs[-1]] * (games - len(kickoffs))
+    return simulate_week(kickoffs, enable_props=props).credits * 4.3
+
+
+def _sheds_props_before_month_end(budget: int, monthly: float) -> bool:
+    """The ladder keeps props while remaining_pct > 30, i.e. while usage < 70% of
+    budget. Anything more and props die partway through the month."""
+    return monthly >= 0.70 * budget
+
+
+def test_the_configured_budget_can_pay_for_a_full_month_of_props() -> None:
+    """**The invariant that was violated.** Not "we stay under budget" — the ledger's
+    props threshold sits at 70% of budget, so merely fitting is not enough. The budget
+    must exceed roughly 1.43x projected usage, or props stop before the month does.
+
+    Deliberately asserted against the **effective** setting rather than the literal
+    default, so a stale `.env` fails here too. `src.config` calls `load_dotenv()` at
+    import, which means this test reads whatever the app would actually run with. That
+    is the point: the drift being caught was between `.env` and the plan, and a test
+    that only ever saw the code default would have passed straight through it.
+    """
+    from src.config import settings
+
+    budget = settings.ODDS_MONTHLY_CREDIT_BUDGET
+    monthly = _simulated_monthly_credits()
+    assert not _sheds_props_before_month_end(budget, monthly), (
+        f"ODDS_MONTHLY_CREDIT_BUDGET={budget:,} vs projected {monthly:,.0f}/month — "
+        f"the ladder sheds props once usage passes {0.70 * budget:,.0f}, which at this "
+        f"burn rate is about day {30 * 0.70 * budget / monthly:.0f} of the month")
+
+
+def test_twenty_thousand_would_have_shed_props_ten_days_in() -> None:
+    """The stale value, pinned as a failure so the number is documented rather than
+    just deleted. If anyone reinstates it, this says what happens."""
+    monthly = _simulated_monthly_credits()
+    assert _sheds_props_before_month_end(20_000, monthly)
+    assert monthly > 20_000        # it would also simply exceed the plan
+
+
+def test_the_budget_survives_a_seventeen_game_week() -> None:
+    """Byes make 16 typical and 17 the maximum. A budget that only works in a light
+    week is a budget that fails in November."""
+    from src.config import settings
+
+    assert not _sheds_props_before_month_end(
+        settings.ODDS_MONTHLY_CREDIT_BUDGET, _simulated_monthly_credits(games=17))
+
+
+def test_the_props_minimum_budget_matches_what_the_simulator_measures() -> None:
+    """`PROPS_MIN_BUDGET` is a hardcoded constant that `validate()` enforces. Tied to
+    the simulator here so it cannot drift away from what the schedules actually cost —
+    otherwise it becomes another number that was right once."""
+    from src.config import PROPS_MIN_BUDGET
+
+    assert not _sheds_props_before_month_end(
+        PROPS_MIN_BUDGET, _simulated_monthly_credits(games=17))
+
+
+def test_props_on_with_the_old_budget_is_reported_as_a_problem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**The combination that went unnoticed.** Neither variable is wrong alone:
+    ENABLE_PROPS=true is a decision, 20,000 is a number. Together they mean "collect
+    props for eleven days, then stop"."""
+    from src.config import Settings
+
+    s = Settings()
+    monkeypatch.setattr(s, "ENABLE_PROPS", True, raising=False)
+    monkeypatch.setattr(s, "ODDS_MONTHLY_CREDIT_BUDGET", 20_000, raising=False)
+    assert any("ENABLE_PROPS" in p for p in s.validate())
+
+
+def test_props_off_with_a_small_budget_is_fine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The false-positive guard. 20,000 is a perfectly good budget for a props-off
+    configuration — measured burn is ~20,000/month — and flagging it would train
+    someone to ignore the validator."""
+    from src.config import Settings
+
+    s = Settings()
+    monkeypatch.setattr(s, "ENABLE_PROPS", False, raising=False)
+    monkeypatch.setattr(s, "ODDS_MONTHLY_CREDIT_BUDGET", 20_000, raising=False)
+    assert not any("ENABLE_PROPS" in p for p in s.validate())
+
+
+def test_props_are_the_expensive_tier_and_that_is_known() -> None:
+    """Props roughly double the bill. Pinned so the trade-off stays visible: this is
+    the number any future "just turn props off to save credits" argument has to beat,
+    and props are where the softest prices are (PROP_ENGINE_DESIGN.md §1)."""
+    with_props = _simulated_monthly_credits(props=True)
+    without = _simulated_monthly_credits(props=False)
+    assert with_props > without
+    assert 1.5 < with_props / without < 2.5
