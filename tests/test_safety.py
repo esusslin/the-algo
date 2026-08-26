@@ -135,6 +135,139 @@ def test_missing_data_is_not_evidence(monkeypatch):
     assert r["verdict"] == "OK"
 
 
+# ---- truncation is not a verdict -----------------------------------------
+#
+# A red-team response that hits `max_tokens` is cut off mid-string. The JSON
+# fails to parse, `complete_json` raises, `review_pick` fails open, and the pick
+# is published with verdict OK — a silent non-review that is indistinguishable
+# from a clean bill of health.
+#
+# This actually happened: a model quoted an entire weather dict into `evidence`
+# and blew the 300-token budget. It surfaced only because the golden set ran the
+# same case three times and one run disagreed with the other two. In production
+# it would have looked like an ordinary OK.
+#
+# The fix is `require_complete`, and these pin it. The failure it prevents is
+# specifically a *misdiagnosis*: without the stop_reason check, truncation and
+# "the model ignored the format instruction" produce the same error text but
+# need opposite fixes — raise a limit versus rewrite a prompt.
+
+
+class _FakeUsage:
+    input_tokens = 100
+    output_tokens = 300
+
+
+class _FakeBlock:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(self, text, stop_reason):
+        self.content = [_FakeBlock(text)]
+        self.stop_reason = stop_reason
+        self.usage = _FakeUsage()
+
+
+def _fake_anthropic(monkeypatch, text, stop_reason):
+    """Stand in for the SDK.
+
+    A whole stub module goes into `sys.modules` rather than patching an
+    attribute on the real one, so these run wherever pytest does — the SDK is a
+    server dependency and need not be installed to test our own wrapper around
+    it. `complete` does `from anthropic import Anthropic` inside the function
+    body, so the import resolves through sys.modules at call time and picks
+    this up.
+    """
+    import sys
+    import types
+
+    from src.ai import client as ai_client
+
+    class FakeMessages:
+        @staticmethod
+        def create(**kwargs):
+            return _FakeResponse(text, stop_reason)
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            self.messages = FakeMessages()
+
+    stub = types.ModuleType("anthropic")
+    stub.Anthropic = FakeAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", stub)
+    monkeypatch.setattr(ai_client.settings, "ANTHROPIC_API_KEY", "sk-ant-test", raising=False)
+    monkeypatch.setattr(ai_client, "budget_remaining_pct", lambda: 100.0)
+    calls = []
+    monkeypatch.setattr(ai_client, "_log_call",
+                        lambda *a, **k: calls.append(a) or 0.0)
+    return calls
+
+
+def test_a_truncated_json_response_raises_rather_than_parsing(monkeypatch):
+    """The exact production shape: valid-looking JSON, cut off mid-string."""
+    from src.ai.client import AIUnavailable, complete_json
+
+    _fake_anthropic(monkeypatch,
+                    '{"verdict": "FLAG", "reason": "wind", "evidence": "wind_kph\': 28.0, \'w',
+                    stop_reason="max_tokens")
+    with pytest.raises(AIUnavailable, match="truncated"):
+        complete_json("p", agent="test", max_tokens=300)
+
+
+def test_the_truncation_error_names_the_limit(monkeypatch):
+    """So the person reading the log knows to change a number, not a prompt."""
+    from src.ai.client import AIUnavailable, complete_json
+
+    _fake_anthropic(monkeypatch, '{"verdict": "OK"', stop_reason="max_tokens")
+    with pytest.raises(AIUnavailable) as exc:
+        complete_json("p", agent="test", max_tokens=300)
+    assert "max_tokens=300" in str(exc.value)
+
+
+def test_truncated_tokens_are_still_billed_to_the_ledger(monkeypatch):
+    """We paid for those tokens. A ledger that records only successful calls
+    understates spend exactly when something is looping or misbehaving — which
+    is when you most need the number to be right."""
+    from src.ai.client import AIUnavailable, complete_json
+
+    calls = _fake_anthropic(monkeypatch, '{"verdict": "OK"', stop_reason="max_tokens")
+    with pytest.raises(AIUnavailable):
+        complete_json("p", agent="test", max_tokens=300)
+    assert len(calls) == 1
+
+
+def test_a_complete_response_parses_normally(monkeypatch):
+    from src.ai.client import complete_json
+
+    _fake_anthropic(monkeypatch, '{"verdict": "OK", "reason": "", "evidence": ""}',
+                    stop_reason="end_turn")
+    assert complete_json("p", agent="test")["verdict"] == "OK"
+
+
+def test_prose_may_be_truncated_without_raising(monkeypatch):
+    """`require_complete` defaults off for `complete`. A cut-off narrative
+    paragraph is degraded but usable; a cut-off JSON object is not. Only the
+    JSON path opts in."""
+    from src.ai.client import complete
+
+    _fake_anthropic(monkeypatch, "a partial sentence that stops", stop_reason="max_tokens")
+    assert complete("p", agent="test") == "a partial sentence that stops"
+
+
+def test_a_malformed_but_complete_response_reports_differently(monkeypatch):
+    """Not truncation — the model ignored the format. Same symptom before this
+    change, different fix: rewrite the prompt rather than raise the limit."""
+    from src.ai.client import AIUnavailable, complete_json
+
+    _fake_anthropic(monkeypatch, "I'm afraid I can't do that.", stop_reason="end_turn")
+    with pytest.raises(AIUnavailable, match="could not parse JSON"):
+        complete_json("p", agent="test")
+
+
 # ---- team crosswalk ------------------------------------------------------
 def test_all_teams_resolve_from_full_name():
     for t in TEAMS:

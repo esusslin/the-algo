@@ -75,8 +75,15 @@ def complete(prompt: str, *, agent: str, model: str | None = None,
              system: str = "", max_tokens: int = 800,
              temperature: float | None = None,
              ref_type: str = "", ref_id: str = "",
-             min_budget_pct: float = 2.0) -> str:
-    """One completion. Raises AIUnavailable rather than returning junk."""
+             min_budget_pct: float = 2.0,
+             require_complete: bool = False) -> str:
+    """One completion. Raises AIUnavailable rather than returning junk.
+
+    `require_complete` rejects a response that stopped because it hit
+    `max_tokens`. Prose can survive being cut off; a JSON object cannot, and a
+    truncated one is indistinguishable from a model that ignored the format
+    instruction unless we check `stop_reason` here.
+    """
     if not configured():
         raise AIUnavailable("ANTHROPIC_API_KEY not set")
     if budget_remaining_pct() < min_budget_pct:
@@ -104,8 +111,20 @@ def complete(prompt: str, *, agent: str, model: str | None = None,
         raise AIUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    # Log before any raise below: those tokens were billed whether or not the
+    # response was usable, and a ledger that only records successes will
+    # understate spend exactly when something is going wrong.
     _log_call(agent, model, resp.usage.input_tokens, resp.usage.output_tokens,
               ref_type, ref_id)
+
+    stop = getattr(resp, "stop_reason", None)
+    if stop == "max_tokens":
+        log.warning("%s: response truncated at max_tokens=%d", agent, max_tokens)
+        if require_complete:
+            raise AIUnavailable(
+                f"response truncated at max_tokens={max_tokens} "
+                f"({resp.usage.output_tokens} output tokens) — raise the limit or "
+                f"shorten what the prompt asks for")
     return text.strip()
 
 
@@ -114,7 +133,13 @@ def complete_json(prompt: str, **kwargs) -> dict:
 
     Models sometimes wrap JSON in prose or fences even when told not to, so we
     extract the first balanced object rather than trusting the whole response.
+
+    Truncation is rejected upstream rather than parsed. A JSON object cut off at
+    `max_tokens` fails the same way as one the model never formatted correctly,
+    and the two need completely different fixes — one is a config change, the
+    other a prompt change.
     """
+    kwargs.setdefault("require_complete", True)
     raw = complete(prompt, **kwargs)
     try:
         return json.loads(raw)
