@@ -46,6 +46,9 @@ Return ONLY a JSON object:
 {"verdict": "OK" | "FLAG" | "KILL", "reason": "one sentence", "evidence": "the \
 specific fact from the context that supports this, or empty string"}
 
+Keep `reason` to one sentence and `evidence` to at most 15 words. Quote the \
+single fact you are relying on, not the whole data block it came from.
+
 Rules:
 - OK is the default and the correct answer for the large majority of bets. On a \
 typical slate you should return OK for 85-95% of them.
@@ -56,6 +59,14 @@ MISSING DATA IS NOT EVIDENCE. Empty injury reports, "no forecast available", \
 "not yet declared" and "none recorded" mean we have not collected that data \
 yet. They do NOT mean nothing is wrong, and they are NEVER a reason to FLAG or \
 KILL. Judge only on facts that are actually present.
+
+LINE MOVEMENT IS IN SCOPE, BUT NEVER GROUNDS FOR KILL. If the context reports a \
+NET MOVE marked "significant" and "against the side of this bet", return FLAG. It \
+means the market disagrees with us, not that the bet is disqualified. A move marked \
+"minor", one marked "toward", or no move at all is not a reason to object at all. \
+Use the stated NET MOVE line; do not do your own arithmetic on the individual \
+quotes. Reserve KILL for a stated fact that invalidates the bet itself, such as a \
+key player ruled out.
 
 Other constraints:
 - Never invent facts. If the context contains no stated reason, return OK.
@@ -111,6 +122,89 @@ def _game_context(game_id: str) -> dict[str, Any]:
     }
 
 
+def _fmt_price(price: Any) -> str:
+    """American odds, defensively.
+
+    `price` reaches here from three feeds and has been None (no price recorded
+    yet) and float (a REAL column) in production. `:+d` raises on both — and
+    `_prompt` is evaluated as an argument to `complete_json`, outside the
+    `except AIUnavailable` guard, so a single malformed row would propagate a
+    TypeError out of a function documented as never raising.
+    """
+    try:
+        return f"{int(price):+d}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+# Below these, movement is ordinary market noise rather than a signal. A red-team
+# agent that objects to every half-point tick would downgrade most of a slate.
+MOVE_THRESHOLD = {"spreads": 1.0, "totals": 1.5}
+DEFAULT_MOVE_THRESHOLD = 1.0
+
+
+def _net_move(pick: dict, moves: list[dict]) -> str:
+    """State the net move on the exact side being bet, in points.
+
+    The model is told this rather than asked to derive it. The rows are a
+    per-book time series, and the arithmetic that matters — first quote versus
+    last quote, one side, one book — is easy to get subtly wrong and impossible
+    to audit after the fact from a one-sentence `reason`.
+
+    **Sign convention, which is the whole of this function.** Every row carries
+    that side's own number, so for spreads a number getting larger (-3.0 -> 0.0)
+    means the market is pricing that side as weaker: a move against the bet. The
+    same holds for an over, where a rising total is harder to reach. It inverts
+    for an under, where a rising total is help. That single inversion is the bug
+    waiting to happen here, and `test_ai_prompt.py` pins all of it.
+    """
+    side = str(pick.get("side") or "").lower()
+    mtype = pick.get("market_type")
+    rows = [m for m in moves
+            if m.get("market_type") == mtype
+            and str(m.get("side") or "").lower() == side
+            and isinstance(m.get("line"), (int, float))]
+    if len(rows) < 2:
+        return ""
+
+    # One book at a time. Mixing books measures disagreement between them, not
+    # movement over time.
+    by_book: dict[str, list[dict]] = {}
+    for m in rows:
+        by_book.setdefault(str(m.get("book")), []).append(m)
+    book, series = max(by_book.items(), key=lambda kv: len(kv[1]))
+    if len(series) < 2:
+        return ""
+
+    series.sort(key=lambda m: str(m.get("observed_at") or ""))
+    first, last = float(series[0]["line"]), float(series[-1]["line"])
+    delta = last - first
+    if delta == 0:
+        return f"NET MOVE ({book}): none, steady at {first}"
+
+    against = delta < 0 if side == "under" else delta > 0
+    threshold = MOVE_THRESHOLD.get(str(mtype), DEFAULT_MOVE_THRESHOLD)
+    size = "significant" if abs(delta) >= threshold else "minor"
+    return (f"NET MOVE ({book}): {first} -> {last}, "
+            f"{abs(delta):.1f} points {'against' if against else 'toward'} "
+            f"the side of this bet ({size})")
+
+
+def _line_moves_text(pick: dict, moves: list[dict]) -> str:
+    if not moves:
+        return "- none recorded"
+    # Oldest first, so movement reads left to right the way a human would draw
+    # it. The query returns newest-first for the LIMIT to be meaningful.
+    ordered = sorted(moves, key=lambda m: str(m.get("observed_at") or ""))
+    out = [f"- {m.get('observed_at')} {m.get('market_type')} {m.get('side')} "
+           f"line {m.get('line')} @ {_fmt_price(m.get('price'))} ({m.get('book')})"
+           for m in ordered]
+    summary = _net_move(pick, ordered)
+    if summary:
+        out.append(summary)
+    return chr(10).join(out)
+
+
 def _prompt(pick: dict, ctx: dict) -> str:
     info = describe_market(pick["market_type"])
     late_season = (ctx.get("week") or 0) >= 17 and ctx.get("season_type") == "REG"
@@ -137,10 +231,8 @@ INACTIVES
 {chr(10).join(f"- {i['team']} {i['player_name']}" for i in ctx.get('inactives', []))
  or '- not yet declared'}
 
-RECENT LINE MOVEMENT
-{chr(10).join(f"- {m['market_type']} {m['side']} {m['line']} -> {m['price']:+d} "
-              f"({m['book']})" for m in ctx.get('recent_line_moves', []))
- or '- none recorded'}
+RECENT LINE MOVEMENT (oldest first)
+{_line_moves_text(pick, ctx.get('recent_line_moves') or [])}
 
 PROPOSED BET
 {pick.get('headline')}
@@ -166,6 +258,19 @@ def _evidence_grounded(evidence: str, context_blob: str) -> bool:
     return len(overlap) >= max(1, min(2, len(ev_tokens) // 3))
 
 
+def _movement_only(evidence: str, situational: str, movement: str) -> bool:
+    """Does the cited evidence come from the line-movement section and nowhere else?
+
+    Deliberately asymmetric: it must ground in `movement` and fail to ground in
+    `situational`. A KILL citing both a quarterback and a line move keeps its
+    verdict, because the quarterback is doing the work.
+    """
+    if not evidence.strip():
+        return False
+    return (_evidence_grounded(evidence, movement)
+            and not _evidence_grounded(evidence, situational))
+
+
 def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     """Review one pick. Always returns a verdict; never raises."""
     if not settings.ENABLE_AI_REDTEAM:
@@ -178,7 +283,13 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     try:
         out = complete_json(
             _prompt(pick, ctx), agent="redteam", system=SYSTEM,
-            model=settings.MODEL_REASON, max_tokens=300,
+            # 300 was not enough: a model quoting a whole weather dict into
+            # `evidence` truncated mid-string, the JSON failed to parse, and the
+            # agent failed open to OK — a silent non-review that looked like a
+            # clean bill of health. The prompt now caps evidence length; this is
+            # the headroom so that a model ignoring the cap still returns
+            # something parseable.
+            model=settings.MODEL_REASON, max_tokens=600,
             ref_type="pick", ref_id=str(pick.get("pick_id", "")))
     except AIUnavailable as exc:
         # FAIL OPEN. A broken AI layer must not suppress the slate — but the
@@ -205,11 +316,20 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
     # Evidence must quote something actually in the context. Models will
     # otherwise cite the ABSENCE of data — "no injury report available" — as
     # grounds to object, which would gut a slate whenever ingestion is behind.
+    # The two halves are kept apart on purpose: a KILL is allowed to rest on a
+    # situational fact but not on line movement alone. See the cap below.
+    situational = (str(ctx.get("injuries")) + str(ctx.get("inactives"))
+                   + str(ctx.get("weather"))
+                   + str(ctx.get("week")) + str(ctx.get("season_type"))
+                   + str(ctx.get("home_rest_days")) + str(ctx.get("away_rest_days")))
+    # Line movement is grounded against the *rendered* section, not the raw rows.
+    # A model citing "moved 3.0 points against this bet" shares no 4-character
+    # token with a dict repr of floats, so grounding against the rows would
+    # downgrade the finding straight back to OK — silently undoing the one thing
+    # this section exists to catch.
+    movement = _line_moves_text(pick, ctx.get("recent_line_moves") or [])
+
     if verdict in ("KILL", "FLAG") and not unevidenced:
-        blob = (str(ctx.get("injuries")) + str(ctx.get("inactives"))
-                + str(ctx.get("weather")) + str(ctx.get("recent_line_moves"))
-                + str(ctx.get("week")) + str(ctx.get("season_type"))
-                + str(ctx.get("home_rest_days")) + str(ctx.get("away_rest_days")))
         absence_words = ("no forecast", "not yet declared", "none recorded",
                          "no data", "unavailable", "not available", "missing",
                          "no injury", "empty", "lack of", "absence of")
@@ -217,11 +337,34 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
         if any(w in ev_low for w in absence_words):
             log.info("overriding %s based on missing data: %s", verdict, evidence[:80])
             verdict, reason, evidence = "OK", "", ""
-        elif not _evidence_grounded(evidence, blob):
+        elif not _evidence_grounded(evidence, situational + movement):
             log.info("downgrading ungrounded %s: %s", verdict, evidence[:80])
             verdict = "FLAG" if verdict == "KILL" else "OK"
             if verdict == "OK":
                 reason, evidence = "", ""
+
+    # A KILL resting only on line movement is capped at FLAG.
+    #
+    # KILL unpublishes a pick; FLAG caps tier A at B. That difference should turn
+    # on whether a stated fact invalidates the bet — a starting quarterback ruled
+    # out means the thing you priced no longer exists. A line moving three points
+    # means the market disagrees with you, which is a reason to size down, not to
+    # stand aside. Letting it unpublish would have the agent quietly enforcing
+    # "never bet against a sharp move": a betting strategy, not a safety check,
+    # and one nobody here has tested.
+    #
+    # **Enforced in code rather than in the prompt because the prompt was not
+    # enough.** Asked for FLAG, the model returned KILL on six of six samples
+    # across two runs. A safety property that depends on instruction-following is
+    # not a safety property.
+    #
+    # There is also a diagnostic reason. A pick live at a number the sharp book
+    # left three points ago usually means the pick was generated off a stale
+    # line. Killing it hides that behind a clean slate; flagging it leaves the
+    # evidence where someone will see it.
+    if verdict == "KILL" and _movement_only(evidence, situational, movement):
+        log.info("capping movement-only KILL at FLAG: %s", evidence[:80])
+        verdict = "FLAG"
 
     return {"verdict": verdict, "reason": reason, "evidence": evidence,
             "source": "model"}
