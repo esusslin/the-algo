@@ -18,13 +18,59 @@ import io
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.db import db, upsert_rows, utcnow
+
+EASTERN = ZoneInfo("America/New_York")
+
+
+def et_to_utc(gameday: str, gametime: str) -> str | None:
+    """Convert games.csv's `gameday` + `gametime` into a real UTC timestamp.
+
+    **This was the bug.** games.csv publishes kickoff in *Eastern* time. The column it
+    lands in is called `kickoff_utc`, and nothing ever converted it — so every consumer
+    treating it as UTC was reading a time four or five hours early.
+
+    That is not cosmetic. `capture_closing_lines` fires when
+    `datetime(kickoff_utc) <= datetime('now', '+12 minutes')`, and `datetime('now')` in
+    SQLite is UTC. For an 8:20pm ET kickoff the comparison came true at about 4:08pm ET,
+    so the "closing" price captured was a late-afternoon one. CLV — the headline metric
+    of the whole system — was being measured against the wrong number, and because odds
+    disappear at kickoff it is not recoverable afterwards.
+
+    Confirmed live on 9 September 2026: `/health` reported `soonest=6.5h` at 13:50 UTC
+    for a kickoff genuinely 10.5 hours away. 20:20 − 13:50 = 6.5 exactly.
+
+    **Why `zoneinfo` and not a fixed offset.** Eastern is UTC−4 under EDT and UTC−5 under
+    EST, and the NFL season straddles the change on the first Sunday in November — which
+    is mid-season, not a corner case. A hardcoded `+4 hours` would be correct today and
+    silently an hour wrong for the back half of every season.
+    """
+    if not gameday:
+        return None
+    if not gametime:
+        # Date with no time — leave it as a bare date rather than inventing midnight in
+        # some timezone. Consumers already handle a missing time.
+        return gameday
+    try:
+        naive = datetime.strptime(f"{gameday}T{gametime}", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "unparseable kickoff %r %r — storing date only", gameday, gametime
+        )
+        return gameday
+    return (
+        naive.replace(tzinfo=EASTERN)
+        .astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+    )
 
 log = logging.getLogger(__name__)
 
@@ -217,13 +263,13 @@ def load_games(seasons: list[int] | None = None) -> int:
             continue
         gameday = (rec.get("gameday") or "").strip()
         gametime = (rec.get("gametime") or "").strip()
-        kickoff = f"{gameday}T{gametime}:00" if gameday and gametime else gameday or None
+        kickoff = et_to_utc(gameday, gametime)
         rows.append({
             "game_id": rec.get("game_id"),
             "season": season,
             "week": _to_int(rec.get("week")),
             "season_type": rec.get("game_type"),
-            "kickoff_utc": kickoff,          # NOTE: games.csv time is ET, not UTC
+            "kickoff_utc": kickoff,          # genuinely UTC now — see et_to_utc()
             "home_team": rec.get("home_team"),
             "away_team": rec.get("away_team"),
             "stadium": rec.get("stadium"),

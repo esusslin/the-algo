@@ -258,11 +258,39 @@ def generate(source: str = "market_engine",
     }
 
 
-def current_slate(include_unpublished: bool = False) -> list[dict]:
-    sql = ("SELECT * FROM picks WHERE result='pending'")
+def current_slate(include_unpublished: bool = False,
+                  include_started: bool = False) -> list[dict]:
+    """Pending picks, newest edge first.
+
+    **Kicked-off games are excluded by default.** A pick stays `pending` until grading
+    runs at 03:30, so without this filter a bet for an 8:20pm game was still listed as
+    actionable at 10pm — and on a Sunday, with kickoffs at 1:00, 4:25 and 8:20, most of
+    the afternoon slate would be dead games presented as live ones. `POST /api/bets`
+    would have accepted them.
+
+    Nothing here changes what gets *stored*; a pick's own record is untouched and it
+    reappears in history once graded. This is about what the app offers you now.
+
+    `include_started=True` is for admin and for grading, which legitimately want
+    everything still pending regardless of clock.
+
+    Uses `datetime()` on both sides rather than string comparison, because kickoffs are
+    written offset-aware (`...+00:00`) and `datetime('now')` is not — a raw `<=` between
+    those two strings compares the offset suffix as text and is quietly wrong.
+    """
+    sql = "SELECT p.* FROM picks p"
+    if not include_started:
+        # LEFT JOIN, not INNER: a pick whose game row is missing should still show
+        # rather than silently vanish. Absence of a kickoff is not evidence of kickoff.
+        sql += (" LEFT JOIN games g ON g.game_id = p.game_id"
+                " WHERE p.result='pending'"
+                " AND (g.kickoff_utc IS NULL OR datetime(g.kickoff_utc) > datetime('now'))")
+    else:
+        sql += " WHERE p.result='pending'"
     if not include_unpublished:
-        sql += " AND published=1"
-    sql += " ORDER BY CASE tier WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END, edge_pct DESC"
+        sql += " AND p.published=1"
+    sql += (" ORDER BY CASE p.tier WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END,"
+            " p.edge_pct DESC")
     return [dict(r) for r in query(sql)]
 
 

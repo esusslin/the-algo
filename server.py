@@ -219,6 +219,24 @@ async def lifespan(app: FastAPI):
     version = run_migrations()
     log.info("schema version %s at %s", version, settings.DATABASE_PATH)
 
+    # Data migration that can't be a schema migration: converting kickoffs from Eastern
+    # to UTC needs `zoneinfo` for DST, and MIGRATIONS is pure SQL run through
+    # `executescript`. The SQL alternative — `datetime(kickoff_utc, 'utc')` — resolves
+    # against the *container's* timezone, so it would be silently correct locally (TZ is
+    # set) and silently a no-op wherever TZ isn't. A conversion that quietly does nothing
+    # is worse than one that doesn't exist.
+    #
+    # Safe on every boot: it skips anything already offset-aware, so the first deploy
+    # converts and every deploy after is a no-op. See scripts/backfill_kickoff_utc.py.
+    try:
+        from scripts.backfill_kickoff_utc import backfill_kickoffs
+
+        converted = backfill_kickoffs()
+        if converted:
+            log.warning("converted %d kickoff timestamps from Eastern to UTC", converted)
+    except Exception:  # noqa: BLE001 — never block startup on a backfill
+        log.exception("kickoff backfill failed — timestamps may still be Eastern")
+
     problems = settings.validate()
     for p in problems:
         log.error("CONFIG: %s", p)
@@ -611,6 +629,19 @@ def log_bet(body: BetBody, user: dict = Depends(auth.current_user)) -> dict:
     if not pick:
         raise HTTPException(404, "pick not found")
     p = pick[0]
+
+    # Filtering kicked-off games out of the slate is a display fix; this is the
+    # correctness half. A client with a stale slate open — a phone left on a table
+    # through the first quarter — would otherwise happily log a bet nobody could have
+    # placed, and it would flow straight into CLV and the win record as though real.
+    started = query(
+        "SELECT 1 FROM games WHERE game_id=? AND kickoff_utc IS NOT NULL "
+        "AND datetime(kickoff_utc) <= datetime('now')",
+        (p["game_id"],),
+    )
+    if started:
+        raise HTTPException(409, "that game has already kicked off")
+
     dup = query("SELECT id FROM user_bets WHERE user_id=? AND pick_id=?",
                 (user["id"], body.pick_id))
     if dup:
