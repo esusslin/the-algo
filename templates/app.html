@@ -152,6 +152,22 @@
                 :class="filter===f.key && 'on'" x-text="f.label"></button>
       </template>
     </div>
+
+    <!-- Day filter. Second row on purpose: market type and kickoff day are
+         independent axes, and mixing them into one row makes "Spread" and
+         "Today" look mutually exclusive when they aren't. Hidden entirely when
+         every pick is on the same day, so it doesn't add noise mid-week. -->
+    <div class="flex gap-2 mt-2 overflow-x-auto no-scrollbar"
+         x-show="tab==='picks' && dayChips().length" style="scrollbar-width:none">
+      <template x-for="d in dayChips()" :key="d.key">
+        <button @click="day=d.key"
+                class="chip px-3 py-1.5 rounded-full text-xs whitespace-nowrap"
+                :class="day===d.key && 'on'">
+          <span x-text="d.label"></span>
+          <span class="text-slate-500" x-text="d.n"></span>
+        </button>
+      </template>
+    </div>
   </div>
 
   <!-- ---- picks ---- -->
@@ -159,7 +175,15 @@
     <p x-show="!picks.length" class="text-sm text-slate-500 py-12 text-center">
       No picks clear the edge threshold right now. That's usually the correct answer.
     </p>
-    <template x-for="p in picks" :key="p.pick_id">
+    <!-- Distinct from the message above: there ARE picks, just none on the day
+         you've selected. Saying "nothing clears the threshold" here would be a
+         lie about the model rather than a fact about your filter. -->
+    <p x-show="picks.length && !visiblePicks().length"
+       class="text-sm text-slate-500 py-12 text-center">
+      No picks for <span x-text="dayLabel(day)"></span>.
+      <button @click="day='all'" class="text-emerald-400 underline">Show all days</button>
+    </p>
+    <template x-for="p in visiblePicks()" :key="p.pick_id">
       <div class="card p-4" :class="'tier'+p.tier">
         <div class="flex items-start justify-between gap-3">
           <div class="flex-1">
@@ -608,7 +632,54 @@ function algo(){return{
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
   betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
-  showWhy:null, rtVerdicts:[], rtHigh:false,
+  showWhy:null, rtVerdicts:[], rtHigh:false, day:'all',
+
+  // ---- day filter -------------------------------------------------------
+  // Client-side, because /api/picks already returns kickoff_utc — no round trip
+  // to change which day you're looking at.
+  //
+  // This is only correct as of 9 Sep 2026. Before then kickoff_utc held Eastern
+  // time labelled as UTC, so new Date() shifted every game four hours and a
+  // Sunday night kickoff grouped under Monday.
+  dayKey(p){
+    if(!p.kickoff_utc) return 'tbd';
+    const d=new Date(p.kickoff_utc);
+    if(isNaN(d)) return 'tbd';
+    // Local calendar day, not UTC — "today" means the user's today.
+    return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  },
+  dayLabel(key){
+    if(key==='tbd') return 'TBD';
+    const now=new Date();
+    const t=k=>k.getFullYear()+'-'+String(k.getMonth()+1).padStart(2,'0')+'-'+String(k.getDate()).padStart(2,'0');
+    const tomorrow=new Date(now); tomorrow.setDate(now.getDate()+1);
+    if(key===t(now)) return 'Today';
+    if(key===t(tomorrow)) return 'Tomorrow';
+    const d=new Date(key+'T12:00:00');   // midday avoids any DST edge on the label
+    return d.toLocaleDateString(undefined,{weekday:'short',month:'numeric',day:'numeric'});
+  },
+  // Only days that actually have picks get a chip — no empty buttons, and the
+  // counts double as a summary of how the slate is spread across the week.
+  dayChips(){
+    const counts={};
+    for(const p of this.picks){ const k=this.dayKey(p); counts[k]=(counts[k]||0)+1; }
+    const keys=Object.keys(counts).sort();                       // 'tbd' sorts last
+    if(keys.length<2) return [];                                 // one day: nothing to filter
+    return [{key:'all',label:'All',n:this.picks.length}]
+      .concat(keys.map(k=>({key:k,label:this.dayLabel(k),n:counts[k]})));
+  },
+  visiblePicks(){
+    if(this.day==='all') return this.picks;
+    return this.picks.filter(p=>this.dayKey(p)===this.day);
+  },
+  // Called after every refresh. Picks disappear at kickoff now, so the day you
+  // had selected can stop existing while you're looking at it — its chip
+  // vanishes and you're left on an empty list with no visible way back. Falling
+  // back to 'all' is the only state that can't strand someone.
+  pruneDay(){
+    if(this.day==='all') return;
+    if(!this.picks.some(p=>this.dayKey(p)===this.day)) this.day='all';
+  },
 
   async boot(){
     const q=new URLSearchParams(location.search);
@@ -698,6 +769,7 @@ function algo(){return{
     if(this.tab==='picks'){
       const d=await(await fetch('/api/picks?filter='+this.filter,{headers:this.hdr()})).json();
       this.picks=d.picks||[];
+      this.pruneDay();
     }
     if(this.tab==='mybets'){ await this.loadLive(); }
     if(this.tab==='track'){
@@ -842,8 +914,13 @@ function algo(){return{
                      algo:'Algorithm',admin:'Admin'}[this.tab]},
   subtitle(){
     if(this.tab==='picks'){
-      const a=this.picks.filter(p=>p.tier==='A').length, b=this.picks.filter(p=>p.tier==='B').length;
-      return this.picks.length ? a+' A-tier · '+b+' B-tier' : 'nothing clearing threshold';
+      // Count what's on screen, not what was fetched — a header reading
+      // "4 A-tier" above a list showing one is worse than no header.
+      const v=this.visiblePicks();
+      const a=v.filter(p=>p.tier==='A').length, b=v.filter(p=>p.tier==='B').length;
+      if(!v.length) return this.picks.length ? 'none on this day' : 'nothing clearing threshold';
+      return a+' A-tier · '+b+' B-tier'
+             + (this.day==='all' ? '' : ' · '+this.dayLabel(this.day));
     }
     if(this.tab==='mybets'){
       if(!this.live.open && !(this.live.settled_today||[]).length) return 'nothing open';
