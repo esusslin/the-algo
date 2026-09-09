@@ -113,6 +113,19 @@ def _health_heartbeat() -> None:
         ctx["rows_affected"] = 1
 
 
+def _run_alerts() -> None:
+    """Text the admin when something breaks — once, on the transition.
+
+    Deliberately its own job rather than folded into the heartbeat: the heartbeat's
+    only purpose is to prove the scheduler is alive, and giving it a second
+    responsibility means a failure in alerting would look like a dead scheduler.
+    """
+    from src.notify.alerts import run_checks
+    with job_run("alerts") as ctx:
+        out = run_checks()
+        ctx["rows_affected"] = len(out["fired"]) + len(out["recovered"])
+
+
 # Jobs registered now; the rest land as their modules are built (see build calendar).
 GAME_DAYS = "wed,thu,fri,sat,sun,mon"
 """Every weekday the league actually plays on.
@@ -160,6 +173,11 @@ JOBS: list[tuple] = [
     (_grade, "cron", dict(hour=11, minute=0), "grade_morning"),
 
     (_health_heartbeat, "interval", dict(minutes=30), "heartbeat"),
+
+    # Alerts every 15 min. Cheap (three queries), and the window that matters is
+    # "how long can the AI layer be down before I know" — on a Sunday slate, half an
+    # hour of unreviewed picks is a lot of picks.
+    (_run_alerts, "interval", dict(minutes=15), "alerts"),
 ]
 
 # Max staleness per *job_run name* (the name passed to job_run(), not the APScheduler id).

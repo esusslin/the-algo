@@ -551,6 +551,24 @@ MIGRATIONS: list[tuple[int, str]] = [
     ALTER TABLE picks ADD COLUMN prob_source TEXT DEFAULT 'market';
     ALTER TABLE picks ADD COLUMN prob_components TEXT;
     """),
+
+    (8, """
+    -- Alert state, so outage texts are EDGE-triggered.
+    --
+    -- A level-triggered alert — 'still broken' every 30 minutes — trains you to
+    -- ignore it, and an alert you ignore is worse than none because it also
+    -- convinces you that you have monitoring. One text when it breaks, one when
+    -- it recovers, nothing in between.
+    --
+    -- `firing` is the current state; `changed_at` is when it last flipped.
+    CREATE TABLE IF NOT EXISTS alert_state (
+        alert_key   TEXT PRIMARY KEY,
+        firing      INTEGER NOT NULL DEFAULT 0,
+        detail      TEXT,
+        changed_at  TEXT,
+        last_sent   TEXT
+    );
+    """),
 ]
 
 
