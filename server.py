@@ -176,6 +176,23 @@ EXPECTED_FRESHNESS = {
     # this table entirely, which is why a day-of-week gate that skipped Friday games
     # would have shown up as a blank live page and nothing else.
     "fetch_live": timedelta(days=8),
+
+    # The pick pipeline. These three are chained off `_poll_odds` rather than scheduled
+    # in JOBS, and they were absent here — so if `generate` threw, or the
+    # `if result.get("written")` guard stopped being satisfied, /health stayed entirely
+    # green while no picks were produced. Publishing nothing looks identical to
+    # publishing nothing worth betting.
+    #
+    # 24 hours, not tighter: these fire only when a poll actually writes new odds. In
+    # season that is many times a day, so a full day of silence is a real signal. Out of
+    # season the market barely moves and these will go stale legitimately — that is the
+    # accepted cost, and the alternative (a threshold tight enough to be useful in
+    # September) would cry wolf every February until someone deleted it.
+    "build_fair_prices": timedelta(hours=24),
+    "generate_picks": timedelta(hours=24),
+    # Longer, and only meaningful while the flag is on: the red team runs after
+    # generation, so it inherits generation's cadence plus its own failure modes.
+    "redteam_review": timedelta(hours=48),
 }
 
 # A job that has never run is only "degraded" once the process has been up long
@@ -250,7 +267,14 @@ def health() -> JSONResponse:
     jobs: dict[str, dict] = {}
     degraded: list[str] = []
 
-    for job_name, max_age in EXPECTED_FRESHNESS.items():
+    # A job behind a feature flag must not be reported missing when the flag is off —
+    # that is a permanent false alarm, and a permanent false alarm is how a health
+    # endpoint becomes something nobody reads.
+    expected = dict(EXPECTED_FRESHNESS)
+    if not settings.ENABLE_AI_REDTEAM:
+        expected.pop("redteam_review", None)
+
+    for job_name, max_age in expected.items():
         rows = query(
             "SELECT status, finished_at, error FROM job_runs "
             "WHERE job_name=? ORDER BY id DESC LIMIT 1",
