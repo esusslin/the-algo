@@ -108,6 +108,10 @@
         <p class="text-xs text-slate-400" x-text="subtitle()"></p>
       </div>
       <div class="flex items-center gap-3">
+        <button x-show="glossary().length" @click="showGlossary=!showGlossary"
+                class="w-6 h-6 rounded-full border text-xs"
+                :class="showGlossary ? 'border-emerald-500 text-emerald-400' : 'border-slate-600 text-slate-400'"
+                aria-label="What do these numbers mean?">?</button>
         <button @click="refresh()" class="text-xs text-slate-400">
           <span x-text="fresh"></span> ↻
         </button>
@@ -151,6 +155,25 @@
                 class="chip px-3 py-1.5 rounded-full text-xs whitespace-nowrap"
                 :class="filter===f.key && 'on'" x-text="f.label"></button>
       </template>
+    </div>
+
+    <!-- Glossary. One panel, contents keyed off the current tab — the same word
+         means the same thing everywhere, so defining "units" three times in three
+         places is how three definitions eventually disagree. -->
+    <div x-show="showGlossary" x-cloak
+         class="mt-3 p-3 rounded-lg bg-slate-900/70 border border-slate-800">
+      <div class="flex items-start justify-between mb-2">
+        <p class="text-xs text-slate-300">What these numbers mean</p>
+        <button @click="showGlossary=false" class="text-xs text-slate-500">close</button>
+      </div>
+      <dl class="space-y-2">
+        <template x-for="g in glossary()" :key="g.term">
+          <div>
+            <dt class="text-[12px] text-slate-200" x-text="g.term"></dt>
+            <dd class="text-[12px] text-slate-400 leading-snug" x-text="g.def"></dd>
+          </div>
+        </template>
+      </dl>
     </div>
 
     <!-- Day filter. Second row on purpose: market type and kickoff day are
@@ -632,7 +655,49 @@ function algo(){return{
   resetToken:'', resetValid:false, resetReason:'', forgot:false, forgotId:'', forgotMsg:'',
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
   betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
-  showWhy:null, rtVerdicts:[], rtHigh:false, day:'all',
+  showWhy:null, rtVerdicts:[], rtHigh:false, day:'all', showGlossary:false,
+
+  // ---- glossary ---------------------------------------------------------
+  // Terms live in one place and are selected per tab. Defining "units" once in
+  // Picks and again in History is how two definitions eventually disagree.
+  //
+  // Written to be read by someone who does not bet. If a definition needs a
+  // second definition to make sense, it isn't finished.
+  glossary(){
+    const shared={
+      units:{term:'units (u)',def:'Bet size as a fraction of your bankroll, not dollars. 1u is whatever you have decided one unit is worth. Stakes come from fractional Kelly, capped, so they are usually small.'},
+      price:{term:'price (+164, −105)',def:'American odds. A plus number is what you win on a 1u bet; a minus number is what you must stake to win 1u. +164 pays 1.64u, −105 risks 1.05u to win 1u.'},
+      book:{term:'book',def:'The sportsbook currently offering the best price on this bet. The whole method is finding one book out of line with the rest.'},
+    };
+    if(this.tab==='picks') return [
+      {term:'% to win',def:'The chance this bet wins, after removing the bookmakers’ built-in margin from their prices. It is what the market really thinks, not our own forecast — no trained model is live.'},
+      {term:'% edge',def:'Expected profit per unit staked, not the gap between two percentages. At even money a 53.3% chance is worth about 6.6% because you win as much as you risk. A bigger edge means the price is further from fair, not that the bet is safer.'},
+      {term:'A / B / C tier',def:'Confidence in the price, not in the team. A needs the largest edge, the most books quoting, close agreement between them, and a sharp book among them. C is the loosest.'},
+      shared.units, shared.price, shared.book,
+      {term:'fair value',def:'What the price should be if the bookmakers’ margin were removed and their opinions pooled. The number the offered price is compared against.'},
+      {term:'sharp book',def:'A book that prices carefully and moves for real reasons. When one agrees with our number that counts for more than five that copy each other.'},
+      {term:'cross-book disagreement',def:'How far apart the books are on this bet. Wide disagreement usually means somebody has information rather than that there is free money.'},
+      {term:'dark',def:'Generated but not published — visible to admins only. Usually the AI review flagged it, or it did not clear a tier.'},
+      {term:'ai review',def:'A check for reasons NOT to bet: a key player out, weather, a line that moved hard against us. It can only downgrade or veto a pick, never promote one.'},
+    ];
+    if(this.tab==='mybets') return [
+      {term:'winning / losing',def:'Where the bet stands right now, mid-game. It is not settled and it can and does flip. Nothing is counted until the game is final.'},
+      {term:'71.1 of 71.5',def:'Progress toward the line on a player prop — yards so far against the number you need.'},
+      {term:'at risk',def:'Total units staked on bets that have not settled yet.'},
+      shared.units, shared.price, shared.book,
+      {term:'live',def:'The game is in progress. Prices are gone and the bet can no longer be placed — only watched.'},
+    ];
+    if(this.tab==='track') return [
+      {term:'record',def:'Wins, losses and pushes on settled bets. A push is a tie against the line and returns your stake.'},
+      {term:'units won / lost',def:'Profit in units, not dollars — the only figure that compares fairly across different stake sizes.'},
+      {term:'ROI',def:'Profit divided by everything staked. Turning 100u staked into 3u profit is 3% ROI.'},
+      {term:'CLV (closing line value)',def:'Whether the price you got was better than the price just before kickoff. It is the best early read on whether the method works, because it is measurable long before results stop being noise.'},
+      {term:'beat close %',def:'The share of bets where you got a better price than the closing one. Consistently above 50% is the signal worth watching.'},
+      {term:'win rate range',def:'The uncertainty around the win rate given how few bets there are. A 55% rate over 20 bets is not a 55% rate — the range says how much to trust it.'},
+      shared.units,
+    ];
+    return [];
+  },
 
   // ---- day filter -------------------------------------------------------
   // Client-side, because /api/picks already returns kickoff_utc — no round trip
