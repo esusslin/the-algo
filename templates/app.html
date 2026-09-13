@@ -218,7 +218,25 @@
               <span x-show="!p.published" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-900 text-amber-300">dark</span>
               <span x-show="p.demo" class="text-[10px] px-1.5 py-0.5 rounded bg-fuchsia-900 text-fuchsia-300">demo</span>
             </div>
-            <p class="text-xs text-slate-500 mb-1" x-text="p.matchup + ' · ' + p.market_label"></p>
+            <p class="text-xs text-slate-500 mb-2" x-text="p.matchup + ' · ' + p.market_label"></p>
+
+            <!-- The payoff, in money, first.
+                 `edge_pct` is expected profit per unit staked, so 6.5% edge is
+                 literally "$6.50 back on $100" — the percentage and the dollar
+                 figure are the same fact, and only one of them is something a
+                 person can act on. The old card led with "fair value 53.3% from
+                 sharp book across 21 books", which describes how the number was
+                 produced rather than what it is worth. -->
+            <div class="rounded-lg bg-emerald-950/40 border border-emerald-900/50 px-3 py-2.5 mb-2">
+              <p class="text-[15px] text-emerald-100">
+                Bet <span class="font-medium">$100</span> here, expect
+                <span class="font-medium" x-text="'$'+(p.edge_pct).toFixed(2)"></span> back
+              </p>
+              <p class="text-[12px] text-emerald-500/80 mt-0.5"
+                 x-text="'Wins '+Math.round((p.blended_prob ?? p.fair_prob ?? 0)*100)
+                         +' times in 100 · needs '+breakEven(p.best_price)+' to break even'"></p>
+            </div>
+
             <p class="text-[13px] text-slate-400 leading-snug" x-text="p.detail"></p>
             <button @click="showWhy = (showWhy===p.pick_id ? null : p.pick_id)"
                     class="text-[11px] text-slate-500 mt-1"
@@ -253,7 +271,12 @@
           <span class="text-slate-200"
                 x-text="((p.blended_prob ?? p.fair_prob ?? 0)*100).toFixed(1)+'% to win'"></span>
           <span class="text-emerald-400" x-text="p.edge_pct.toFixed(1)+'% edge'"></span>
-          <span class="text-slate-500" x-text="p.kelly_units.toFixed(2)+'u'"></span>
+          <!-- `kelly_units` is a FRACTION OF BANKROLL, so a perfectly normal 1%
+               stake printed as "0.01u" and a 0.4% stake printed as "0.00u" —
+               the app was telling people to bet nothing. Shown as a percentage
+               of bankroll instead: unambiguous, needs no glossary entry, and
+               matches how the stake is actually calculated. -->
+          <span class="text-slate-500" x-text="stakeLabel(p.kelly_units)"></span>
           <button @click="openBet(p)" x-show="!p.i_bet_this && betting!==p.pick_id"
                   class="ml-auto text-xs px-3 py-1.5 rounded border border-slate-600">I bet this</button>
           <span x-show="p.i_bet_this" class="ml-auto text-xs text-emerald-400">logged ✓</span>
@@ -276,8 +299,8 @@
                      class="w-full px-2 py-2 rounded bg-slate-800/60 border border-slate-700 text-xs">
             </div>
             <div>
-              <label class="text-[10px] text-slate-500">Units</label>
-              <input x-model="betForm.stake" type="number" step="0.05" inputmode="decimal"
+              <label class="text-[10px] text-slate-500">% of roll</label>
+              <input x-model="betForm.stake" type="number" step="0.1" min="0" inputmode="decimal"
                      class="w-full px-2 py-2 rounded bg-slate-800/60 border border-slate-700 text-xs">
             </div>
           </div>
@@ -665,7 +688,7 @@ function algo(){return{
   // second definition to make sense, it isn't finished.
   glossary(){
     const shared={
-      units:{term:'units (u)',def:'Bet size as a fraction of your bankroll, not dollars. 1u is whatever you have decided one unit is worth. Stakes come from fractional Kelly, capped, so they are usually small.'},
+      units:{term:'% of roll',def:'Suggested bet size as a percentage of your bankroll, not dollars. 1% of a $500 roll is $5. Sizes come from fractional Kelly and are capped, so they stay small on purpose — a bigger edge earns a bigger stake, never your whole roll.'},
       price:{term:'price (+164, −105)',def:'American odds. A plus number is what you win on a 1u bet; a minus number is what you must stake to win 1u. +164 pays 1.64u, −105 risks 1.05u to win 1u.'},
       book:{term:'book',def:'The sportsbook currently offering the best price on this bet. The whole method is finding one book out of line with the rest.'},
     };
@@ -734,8 +757,34 @@ function algo(){return{
       .concat(keys.map(k=>({key:k,label:this.dayLabel(k),n:counts[k]})));
   },
   visiblePicks(){
-    if(this.day==='all') return this.picks;
-    return this.picks.filter(p=>this.dayKey(p)===this.day);
+    const list = this.day==='all'
+      ? this.picks
+      : this.picks.filter(p=>this.dayKey(p)===this.day);
+    // Ranked by chance of winning, highest first — what someone betting today
+    // actually scans for.
+    //
+    // Worth knowing that this is NOT the same order as edge, and can be close
+    // to its opposite. A heavy favourite wins most of the time at a price that
+    // already charges you for it; the biggest edges tend to sit on near coin
+    // flips. Sorting by win probability puts the most reassuring bets on top,
+    // not the most profitable ones. `% edge` stays on every card so the
+    // difference is visible rather than hidden by the ordering.
+    //
+    // Copy rather than sort in place: `this.picks` is the source of truth for
+    // the day chips and their counts, and mutating it here would reorder them
+    // as a side effect of rendering.
+    return [...list].sort((a,b)=>
+      ((b.blended_prob ?? b.fair_prob ?? 0) - (a.blended_prob ?? a.fair_prob ?? 0))
+      || (b.edge_pct - a.edge_pct));       // ties broken by edge
+  },
+  // Win rate a price needs just to break even, before any edge. Gives the
+  // headline probability something to be compared against — 53% means nothing
+  // on its own, and everything next to "needs 50%".
+  breakEven(price){
+    if(!price) return '—';
+    const p = Number(price);
+    const d = p > 0 ? 1 + p/100 : 1 + 100/Math.abs(p);
+    return Math.round(100/d) + '%';
   },
   // Called after every refresh. Picks disappear at kickoff now, so the day you
   // had selected can stop existing while you're looking at it — its chip
@@ -858,12 +907,25 @@ function algo(){return{
   },
   openBet(p){
     this.betting=p.pick_id;
-    this.betForm={book:p.best_book, price:p.best_price, stake:p.kelly_units.toFixed(2)};
+    // Prefill the suggested stake as a PERCENTAGE, matching what the card shows.
+    // Prefilling "0.01" invited people to type a real dollar figure into a field
+    // that meant a fraction of bankroll, which is a 100x error in the logged bet
+    // and silently wrecks the ROI history it feeds.
+    this.betForm={book:p.best_book, price:p.best_price,
+                  stake:((p.kelly_units||0)*100).toFixed(2)};
   },
   async confirmBet(p){
+    // The FORM is in percent of bankroll; STORAGE stays in bankroll fractions,
+    // unchanged. Converting here rather than changing the stored unit is
+    // deliberate: every existing user_bets row, every graded payout and the
+    // whole ROI history are in fractions, and writing percentages into the same
+    // column would leave two scales mixed in one series with nothing to tell
+    // them apart afterwards. Display is a presentation choice; the ledger's
+    // unit is not.
     const r=await fetch('/api/bets',{method:'POST',headers:this.hdr(),
       body:JSON.stringify({pick_id:p.pick_id, book:this.betForm.book,
-        price:parseInt(this.betForm.price), stake:parseFloat(this.betForm.stake)})});
+        price:parseInt(this.betForm.price),
+        stake:parseFloat(this.betForm.stake)/100})});
     if(r.ok){ p.i_bet_this=true; this.betting=null; }
     else { const d=await r.json(); alert(d.detail||'Could not log that bet'); }
   },
@@ -941,6 +1003,14 @@ function algo(){return{
   },
 
   fmtOdds(p){return p>0?'+'+p:''+p},
+  // Stake as a share of bankroll. Never rounds a real bet to zero: anything
+  // under 0.05% is shown as "<0.1%" rather than "0.0%", because a stake of zero
+  // and a stake too small to print are different instructions.
+  stakeLabel(u){
+    const pct = (u||0)*100;
+    if(pct <= 0) return '—';
+    return (pct < 0.1 ? '<0.1' : pct.toFixed(1)) + '% of roll';
+  },
   probParts(p){
     // Renders whatever fed the probability, so new components appear here
     // automatically as they're added upstream — no UI change needed.
@@ -973,7 +1043,7 @@ function algo(){return{
       </div>
       ${score}
       <p class="text-xs mt-1 ${noteColor}">${this.esc(b.note||'')}</p>
-      <p class="text-[11px] text-slate-600 mt-1">${this.esc(b.book||'')} ${this.fmtOdds(b.price)} · ${(b.stake||0).toFixed(2)}u</p>`;
+      <p class="text-[11px] text-slate-600 mt-1">${this.esc(b.book||'')} ${this.fmtOdds(b.price)} · ${this.stakeLabel(b.stake)}</p>`;
   },
   tabTitle(){return {picks:'Picks',mybets:'Open bets',track:'History',
                      algo:'Algorithm',admin:'Admin'}[this.tab]},
