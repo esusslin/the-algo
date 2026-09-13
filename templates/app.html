@@ -237,21 +237,25 @@
             </div>
             <p class="text-xs text-slate-500 mb-2" x-text="p.matchup + ' · ' + p.market_label"></p>
 
-            <!-- The payoff, in money, first.
-                 `edge_pct` is expected profit per unit staked, so 6.5% edge is
-                 literally "$6.50 back on $100" — the percentage and the dollar
-                 figure are the same fact, and only one of them is something a
-                 person can act on. The old card led with "fair value 53.3% from
-                 sharp book across 21 books", which describes how the number was
-                 produced rather than what it is worth. -->
+            <!-- The instruction: size, price, book. Nothing else.
+
+                 No payout figure. A bettor reading -190 already knows what it
+                 pays, and the version that spelled it out got it wrong in a
+                 worse way — it showed expected value ($2.88) in a sentence
+                 shaped like a payout ($52.63). Both numbers were true; only one
+                 was being asked for, and neither was the point.
+
+                 The second line is the product's only real claim: the market
+                 says X, this book is still paying better. Everything further
+                 down the card is evidence for that sentence. -->
             <div class="rounded-lg bg-emerald-950/40 border border-emerald-900/50 px-3 py-2.5 mb-2">
               <p class="text-[15px] text-emerald-100">
-                Bet <span class="font-medium">$100</span> here, expect
-                <span class="font-medium" x-text="'$'+(p.edge_pct).toFixed(2)"></span> back
+                Bet <span class="font-medium" x-text="stakePct(p.kelly_units)"></span>
+                of your roll at
+                <span class="font-medium" x-text="fmtOdds(p.best_price)"></span>
+                on <span class="font-medium" x-text="p.best_book"></span>
               </p>
-              <p class="text-[12px] text-emerald-500/80 mt-0.5"
-                 x-text="'Wins '+Math.round((p.blended_prob ?? p.fair_prob ?? 0)*100)
-                         +' times in 100 · needs '+breakEven(p.best_price)+' to break even'"></p>
+              <p class="text-[12px] text-emerald-500/80 mt-0.5" x-text="whyText(p)"></p>
             </div>
 
             <p class="text-[13px] text-slate-400 leading-snug" x-text="p.detail"></p>
@@ -800,6 +804,29 @@ function algo(){return{
     return (this.SORTS.find(x=>x.key===this.sort) || this.SORTS[0]).hint;
   },
   saveSort(){ try{ localStorage.setItem('algo.sort', this.sort) }catch(e){} },
+  // Bare percentage for the instruction line, where "% of your roll" is already
+  // in the surrounding sentence. `stakeLabel` carries its own suffix and is for
+  // the stat row, where nothing else supplies the unit.
+  stakePct(u){
+    const pct = (u||0)*100;
+    if(pct <= 0) return '—';
+    return (pct < 0.1 ? '<0.1%' : pct.toFixed(1)+'%');
+  },
+  // Why this price, in one line. The product's actual claim is "the market says
+  // X, this book is still paying Y" — everything else on the card is evidence
+  // for that sentence. Books count and edge, nothing else: a bettor reading a
+  // price knows what it pays.
+  whyText(p){
+    // `book_count` is not a column on picks — it rides inside the
+    // `prob_components` JSON, which is also what the "where does this number
+    // come from?" panel reads. Taking it from there rather than adding a column
+    // keeps one source for the figure; two would eventually disagree.
+    let books = 0;
+    try{ books = (JSON.parse(p.prob_components||'{}').book_count) || 0 }catch(e){}
+    const gap = (winProb(p)*100).toFixed(1);
+    return (books ? `${books} books say ${gap}%` : `Market says ${gap}%`)
+         + ` · this price is ${p.edge_pct.toFixed(1)}% better than fair`;
+  },
   // Win rate a price needs just to break even, before any edge. Gives the
   // headline probability something to be compared against — 53% means nothing
   // on its own, and everything next to "needs 50%".
