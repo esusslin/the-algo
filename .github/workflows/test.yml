@@ -26,6 +26,13 @@ jobs:
           JWT_SECRET_KEY: test
         run: pytest tests/ -q
 
+      # The pick-ordering comparators live in templates/app.html, so pytest
+      # never sees them. This extracts them from the template at runtime and
+      # runs them — it fails loudly if the extraction stops matching, because a
+      # silently-skipped test is worse than no test.
+      - name: Pick ordering (JS)
+        run: node tests/js/sort_picks.mjs
+
       # Railway deploys on push regardless of CI, so this is a signal rather
       # than a gate. If you want it to block, enable "Wait for CI" in the
       # Railway service settings.

@@ -191,6 +191,23 @@
         </button>
       </template>
     </div>
+
+    <!-- Sort. Deliberately NOT a generic "click any column" control: these
+         numbers answer different questions and only one direction of each is
+         ever useful. Nobody wants the least likely bet or the worst price, so
+         each option carries its own direction and there is no ascending toggle
+         to get stuck in. -->
+    <div class="flex gap-2 mt-2 overflow-x-auto no-scrollbar"
+         x-show="tab==='picks' && picks.length>1" style="scrollbar-width:none">
+      <span class="text-[11px] text-slate-500 self-center pr-1 whitespace-nowrap">Sort</span>
+      <template x-for="s in SORTS" :key="s.key">
+        <button @click="sort=s.key; saveSort()"
+                class="chip px-3 py-1.5 rounded-full text-xs whitespace-nowrap"
+                :class="sort===s.key && 'on'" x-text="s.label"></button>
+      </template>
+    </div>
+    <p x-show="tab==='picks' && visiblePicks().length>1"
+       class="text-[11px] text-slate-500 pt-1" x-text="sortHint()"></p>
   </div>
 
   <!-- ---- picks ---- -->
@@ -670,6 +687,11 @@
 </div>
 
 <script>
+// Win probability with a documented fallback order. Used by both the sort
+// comparators and the card, so the number the list is ordered by is provably
+// the number the card displays.
+function winProb(p){ return p.blended_prob ?? p.fair_prob ?? 0 }
+
 function algo(){return{
   token:localStorage.getItem('algo_token')||'', user:{}, tab:'picks', scope:'mine',
   filter:'all', filters:[{key:'all',label:'All'}], picks:[], hist:{}, live:{}, invites:[], algo:{},
@@ -679,6 +701,10 @@ function algo(){return{
   busy:'', ingestMsg:'', demoMsg:'', profilePhone:'', profileMsg:'', status:{}, poller:null,
   betting:null, betForm:{book:'',price:0,stake:0}, account:false, ai:{}, rtMsg:'',
   showWhy:null, rtVerdicts:[], rtHigh:false, day:'all', showGlossary:false,
+  // Restored from the last visit: a sort is a preference, and making
+  // someone re-pick it on every load is how a control stops being used.
+  sort:(()=>{ try{ return localStorage.getItem('algo.sort') || 'win' }
+              catch(e){ return 'win' } })(),
 
   // ---- glossary ---------------------------------------------------------
   // Terms live in one place and are selected per tab. Defining "units" once in
@@ -760,23 +786,20 @@ function algo(){return{
     const list = this.day==='all'
       ? this.picks
       : this.picks.filter(p=>this.dayKey(p)===this.day);
-    // Ranked by chance of winning, highest first — what someone betting today
-    // actually scans for.
-    //
-    // Worth knowing that this is NOT the same order as edge, and can be close
-    // to its opposite. A heavy favourite wins most of the time at a price that
-    // already charges you for it; the biggest edges tend to sit on near coin
-    // flips. Sorting by win probability puts the most reassuring bets on top,
-    // not the most profitable ones. `% edge` stays on every card so the
-    // difference is visible rather than hidden by the ordering.
-    //
+    const s = this.SORTS.find(x=>x.key===this.sort) || this.SORTS[0];
     // Copy rather than sort in place: `this.picks` is the source of truth for
     // the day chips and their counts, and mutating it here would reorder them
     // as a side effect of rendering.
-    return [...list].sort((a,b)=>
-      ((b.blended_prob ?? b.fair_prob ?? 0) - (a.blended_prob ?? a.fair_prob ?? 0))
-      || (b.edge_pct - a.edge_pct));       // ties broken by edge
+    //
+    // Every comparator falls back to win probability, so two picks that tie on
+    // the chosen number still land in a stable, meaningful order rather than
+    // whatever order the API happened to return.
+    return [...list].sort((a,b)=> s.cmp(a,b) || (winProb(b) - winProb(a)));
   },
+  sortHint(){
+    return (this.SORTS.find(x=>x.key===this.sort) || this.SORTS[0]).hint;
+  },
+  saveSort(){ try{ localStorage.setItem('algo.sort', this.sort) }catch(e){} },
   // Win rate a price needs just to break even, before any edge. Gives the
   // headline probability something to be compared against — 53% means nothing
   // on its own, and everything next to "needs 50%".
@@ -1003,6 +1026,35 @@ function algo(){return{
   },
 
   fmtOdds(p){return p>0?'+'+p:''+p},
+
+  // Sort options. Each carries its own direction, because only one direction of
+  // each of these is ever a question someone asks — nobody is looking for the
+  // least likely bet or the widest market disagreement.
+  //
+  // `hint` exists because the two headline sorts are close to OPPOSITES and the
+  // ordering alone hides that. Biggest edges sit on near coin flips; safest bets
+  // are favourites whose price already charges you for being likely. A user
+  // switching between them and seeing the list invert deserves to know why.
+  SORTS: [
+    {key:'win',  label:'Best chance',
+     hint:'Most likely to win first. These are usually favourites, where the price already reflects it.',
+     cmp:(a,b)=> winProb(b) - winProb(a)},
+    {key:'edge', label:'Best value',
+     hint:'Biggest expected profit per $100 first. Often near coin flips — the price is wrong, not the bet safe.',
+     cmp:(a,b)=> (b.edge_pct||0) - (a.edge_pct||0)},
+    {key:'time', label:'Kickoff',
+     hint:'Soonest kickoff first.',
+     // A missing kickoff sorts LAST. `||''` would put it first, because the
+     // empty string precedes every timestamp — so the games we know least about
+     // would lead a list whose whole purpose is "what starts next".
+     cmp:(a,b)=> (a.kickoff_utc||'￿').localeCompare(b.kickoff_utc||'￿')},
+    {key:'stake', label:'Biggest stake',
+     hint:'Largest suggested stake first — where the model wants the most money.',
+     cmp:(a,b)=> (b.kelly_units||0) - (a.kelly_units||0)},
+    {key:'tier', label:'Tier',
+     hint:'A tier first: most books quoting, closest agreement, a sharp book among them.',
+     cmp:(a,b)=> String(a.tier||'Z').localeCompare(String(b.tier||'Z'))},
+  ],
   // Stake as a share of bankroll. Never rounds a real bet to zero: anything
   // under 0.05% is shown as "<0.1%" rather than "0.0%", because a stake of zero
   // and a stake too small to print are different instructions.
