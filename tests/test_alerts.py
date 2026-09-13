@@ -39,6 +39,9 @@ def alert_db(monkeypatch):
         "CREATE TABLE ai_calls (id INTEGER PRIMARY KEY, agent TEXT, created_at TEXT);"
         "CREATE TABLE alert_state (alert_key TEXT PRIMARY KEY, firing INTEGER,"
         "  detail TEXT, changed_at TEXT, last_sent TEXT);"
+        "CREATE TABLE picks (pick_id INTEGER PRIMARY KEY, game_id TEXT, result TEXT,"
+        "  published INTEGER, review_hash TEXT);"
+        "CREATE TABLE games (game_id TEXT PRIMARY KEY, kickoff_utc TEXT);"
     )
 
     class _Ctx:
@@ -56,42 +59,83 @@ def _ago(**kw) -> str:
     return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat(timespec="seconds")
 
 
+def _ran(conn, **kw) -> None:
+    conn.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
+                 (_ago(**(kw or {"minutes": 20})),))
+
+
+def _pick(conn, pick_id=1, review_hash=None, published=1, result="pending",
+          kickoff="2099-01-01T00:00:00+00:00") -> None:
+    gid = f"g{pick_id}"
+    conn.execute("INSERT INTO games VALUES (?,?)", (gid, kickoff))
+    conn.execute("INSERT INTO picks VALUES (?,?,?,?,?)",
+                 (pick_id, gid, result, published, review_hash))
+
+
 # --- the AI detector -----------------------------------------------------------------
 #
-# The one that would have caught 9 September. When the API rejects a call, the exception
-# is raised inside `complete()` BEFORE `_log_call`, so nothing lands in `ai_calls`.
-# Meanwhile `apply_to_picks` catches it, returns OK, and the job records success.
-# Job ran + empty ledger = every call failed, and no other signal shows it.
+# Originally: "the job ran and `ai_calls` is empty, so every call failed." That was the
+# right rule until review caching landed, at which point a HEALTHY system started making
+# zero calls for hours — nothing that feeds a verdict had moved. The old rule would have
+# become a permanent false alarm, and a permanent false alarm is how a monitor gets
+# muted.
+#
+# So it now keys on the symptom rather than the mechanism: are there live picks nobody
+# has reviewed? `review_hash` is written only when a review actually reached the model,
+# so NULL means genuinely unreviewed — whatever the cause, including a cache bug of our
+# own making.
 
 
-def test_job_ran_but_no_api_calls_is_an_outage(alert_db) -> None:
+def test_unreviewed_live_picks_after_a_run_is_an_outage(alert_db) -> None:
     from src.notify.alerts import check_ai_layer
 
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
     result = check_ai_layer()
     assert result.firing is True
     assert "UNREVIEWED" in result.detail
 
 
-def test_job_ran_and_calls_were_logged_is_healthy(alert_db) -> None:
+def test_a_quiet_cache_with_everything_reviewed_is_healthy(alert_db) -> None:
+    """**The regression this rewrite exists to prevent.** Zero API calls in six
+    hours is now the normal, correct, cheap state. Alerting on it would fire
+    permanently from the day caching shipped."""
     from src.notify.alerts import check_ai_layer
 
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
-    alert_db.execute("INSERT INTO ai_calls VALUES (1,'redteam',?)", (_ago(minutes=19),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash="abc123")
+    result = check_ai_layer()
+    assert result.firing is False
+    assert alert_db.execute("SELECT COUNT(*) FROM ai_calls").fetchone()[0] == 0
+
+
+def test_an_unreviewed_pick_for_a_started_game_is_not_an_outage(alert_db) -> None:
+    """The bet is not placeable, so nobody is exposed to an unreviewed pick."""
+    from src.notify.alerts import check_ai_layer
+
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None, kickoff="2020-01-01T00:00:00+00:00")
     assert check_ai_layer().firing is False
 
 
-def test_an_old_run_with_no_calls_is_not_an_ai_outage(alert_db) -> None:
-    """Nothing has run recently, so an empty ledger proves nothing about the API. That
-    is a staleness problem and `check_stale_jobs` owns it — two checks firing for one
-    cause is how an alert becomes noise."""
+def test_an_unpublished_pick_is_not_an_outage(alert_db) -> None:
+    """A KILLed or withheld pick is not in front of a user."""
     from src.notify.alerts import check_ai_layer
 
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(days=3),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None, published=0)
     assert check_ai_layer().firing is False
+
+
+def test_an_old_run_is_not_an_ai_outage(alert_db) -> None:
+    """Nothing has run recently, so unreviewed picks prove nothing about the API.
+    That is a staleness problem and `check_stale_jobs` owns it — two checks firing
+    for one cause is how an alert becomes noise."""
+    from src.notify.alerts import check_ai_layer
+
+    _ran(alert_db, days=3)
+    _pick(alert_db, review_hash=None)
+    assert check_ai_layer() is None
 
 
 def test_a_disabled_feature_is_not_an_outage(alert_db, monkeypatch) -> None:
@@ -103,14 +147,15 @@ def test_a_disabled_feature_is_not_an_outage(alert_db, monkeypatch) -> None:
     assert alerts.check_ai_layer() is None
 
 
-def test_calls_from_another_agent_do_not_count(alert_db) -> None:
-    """Narrative generation succeeding says nothing about the red team's own calls."""
+def test_the_alert_reports_the_call_count_for_diagnosis(alert_db) -> None:
+    """Call volume stopped being the trigger but is still the first thing you want
+    to know when deciding between a dead key and a broken cache."""
     from src.notify.alerts import check_ai_layer
 
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
-    alert_db.execute("INSERT INTO ai_calls VALUES (1,'narrative',?)", (_ago(minutes=5),))
-    assert check_ai_layer().firing is True
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
+    alert_db.execute("INSERT INTO ai_calls VALUES (1,'redteam',?)", (_ago(minutes=5),))
+    assert "1 API calls" in check_ai_layer().detail
 
 
 # --- edge triggering -----------------------------------------------------------------
@@ -132,8 +177,8 @@ def test_it_texts_once_when_something_breaks(alert_db, monkeypatch) -> None:
 
     sent = _send_spy(monkeypatch)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
 
     assert alerts.run_checks()["fired"] == ["ai_down"]
     assert len(sent) == 1
@@ -147,8 +192,8 @@ def test_it_does_not_text_again_while_still_broken(alert_db, monkeypatch) -> Non
 
     sent = _send_spy(monkeypatch)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
 
     for _ in range(4):
         alerts.run_checks()
@@ -162,11 +207,11 @@ def test_it_texts_again_on_recovery(alert_db, monkeypatch) -> None:
 
     sent = _send_spy(monkeypatch)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
     alerts.run_checks()
 
-    alert_db.execute("INSERT INTO ai_calls VALUES (1,'redteam',?)", (_ago(minutes=1),))
+    alert_db.execute("UPDATE picks SET review_hash='abc123' WHERE pick_id=1")
     out = alerts.run_checks()
 
     assert out["recovered"] == ["ai_down"]
@@ -181,13 +226,12 @@ def test_a_healthy_system_sends_nothing(alert_db, monkeypatch) -> None:
 
     sent = _send_spy(monkeypatch)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
-    alert_db.execute("INSERT INTO ai_calls VALUES (1,'redteam',?)", (_ago(minutes=5),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash="abc123")
 
     assert alerts.run_checks() == {"checked": 1, "fired": [], "recovered": [],
                                    "state": [{"key": "ai_down", "firing": False,
-                                              "detail": "1 redteam calls in 6h"}]}
+                                              "detail": "no unreviewed live picks"}]}
     assert sent == []
 
 
@@ -205,9 +249,8 @@ def test_a_check_that_raises_becomes_its_own_alert(alert_db, monkeypatch) -> Non
         raise RuntimeError("boom")
 
     monkeypatch.setattr(alerts, "CHECKS", (exploding, alerts.check_ai_layer))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
-    alert_db.execute("INSERT INTO ai_calls VALUES (1,'redteam',?)", (_ago(minutes=5),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash="abc123")
 
     out = alerts.run_checks()
     assert any(k.startswith("check_error") for k in out["fired"])
@@ -224,8 +267,8 @@ def test_a_failed_text_does_not_raise(alert_db, monkeypatch) -> None:
                         lambda *a, **k: {"status": "failed", "error": "twilio down"})
     monkeypatch.setattr(alerts.settings, "ADMIN_PHONE", "+15550001111", raising=False)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
 
     assert alerts.run_checks()["fired"] == ["ai_down"]
     row = alert_db.execute("SELECT firing, last_sent FROM alert_state").fetchone()
@@ -238,8 +281,8 @@ def test_dry_run_sends_nothing(alert_db, monkeypatch) -> None:
 
     sent = _send_spy(monkeypatch)
     monkeypatch.setattr(alerts, "CHECKS", (alerts.check_ai_layer,))
-    alert_db.execute("INSERT INTO job_runs VALUES (1,'redteam_review','success',?)",
-                     (_ago(minutes=20),))
+    _ran(alert_db)
+    _pick(alert_db, review_hash=None)
 
     assert alerts.run_checks(dry_run=True)["fired"] == ["ai_down"]
     assert sent == []

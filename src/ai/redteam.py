@@ -23,6 +23,8 @@ the expensive part is the situational picture, not the individual bet.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -143,6 +145,46 @@ MOVE_THRESHOLD = {"spreads": 1.0, "totals": 1.5}
 DEFAULT_MOVE_THRESHOLD = 1.0
 
 
+def _net_move_parts(pick: dict, moves: list[dict]) -> dict | None:
+    """The net move, as data. `_net_move` formats this; `review_fingerprint` keys on it.
+
+    Split out so the cache and the prompt cannot disagree about what "the market
+    moved" means. Two implementations of that judgement would drift, and the one
+    that drifted silently would be the cache — which is the failure mode this
+    whole change has to avoid.
+    """
+    side = str(pick.get("side") or "").lower()
+    mtype = pick.get("market_type")
+    rows = [m for m in moves
+            if m.get("market_type") == mtype
+            and str(m.get("side") or "").lower() == side
+            and isinstance(m.get("line"), (int, float))]
+    if len(rows) < 2:
+        return None
+
+    # One book at a time. Mixing books measures disagreement between them, not
+    # movement over time.
+    by_book: dict[str, list[dict]] = {}
+    for m in rows:
+        by_book.setdefault(str(m.get("book")), []).append(m)
+    book, series = max(by_book.items(), key=lambda kv: len(kv[1]))
+    if len(series) < 2:
+        return None
+
+    series.sort(key=lambda m: str(m.get("observed_at") or ""))
+    first, last = float(series[0]["line"]), float(series[-1]["line"])
+    delta = last - first
+    threshold = MOVE_THRESHOLD.get(str(mtype), DEFAULT_MOVE_THRESHOLD)
+    return {
+        "book": book,
+        "first": first,
+        "last": last,
+        "delta": delta,
+        "against": (delta < 0 if side == "under" else delta > 0),
+        "size": "significant" if abs(delta) >= threshold else "minor",
+    }
+
+
 def _net_move(pick: dict, moves: list[dict]) -> str:
     """State the net move on the exact side being bet, in points.
 
@@ -158,36 +200,15 @@ def _net_move(pick: dict, moves: list[dict]) -> str:
     for an under, where a rising total is help. That single inversion is the bug
     waiting to happen here, and `test_ai_prompt.py` pins all of it.
     """
-    side = str(pick.get("side") or "").lower()
-    mtype = pick.get("market_type")
-    rows = [m for m in moves
-            if m.get("market_type") == mtype
-            and str(m.get("side") or "").lower() == side
-            and isinstance(m.get("line"), (int, float))]
-    if len(rows) < 2:
+    p = _net_move_parts(pick, moves)
+    if p is None:
         return ""
-
-    # One book at a time. Mixing books measures disagreement between them, not
-    # movement over time.
-    by_book: dict[str, list[dict]] = {}
-    for m in rows:
-        by_book.setdefault(str(m.get("book")), []).append(m)
-    book, series = max(by_book.items(), key=lambda kv: len(kv[1]))
-    if len(series) < 2:
-        return ""
-
-    series.sort(key=lambda m: str(m.get("observed_at") or ""))
-    first, last = float(series[0]["line"]), float(series[-1]["line"])
-    delta = last - first
-    if delta == 0:
-        return f"NET MOVE ({book}): none, steady at {first}"
-
-    against = delta < 0 if side == "under" else delta > 0
-    threshold = MOVE_THRESHOLD.get(str(mtype), DEFAULT_MOVE_THRESHOLD)
-    size = "significant" if abs(delta) >= threshold else "minor"
-    return (f"NET MOVE ({book}): {first} -> {last}, "
-            f"{abs(delta):.1f} points {'against' if against else 'toward'} "
-            f"the side of this bet ({size})")
+    if p["delta"] == 0:
+        return f"NET MOVE ({p['book']}): none, steady at {p['first']}"
+    return (f"NET MOVE ({p['book']}): {p['first']} -> {p['last']}, "
+            f"{abs(p['delta']):.1f} points "
+            f"{'against' if p['against'] else 'toward'} "
+            f"the side of this bet ({p['size']})")
 
 
 def _line_moves_text(pick: dict, moves: list[dict]) -> str:
@@ -203,6 +224,101 @@ def _line_moves_text(pick: dict, moves: list[dict]) -> str:
     if summary:
         out.append(summary)
     return chr(10).join(out)
+
+
+# Weather bands, in the units the feed supplies, placed where football actually
+# changes rather than on an even grid.
+#
+# **Why named thresholds and not round(x / step).** A uniform grid puts a boundary
+# every `step` units, so any true value sitting near one oscillates across it on
+# every refresh and invalidates the cache forever. Measured: a 12 kph wind with
+# ±1.5 kph of feed jitter sat exactly on an 8-unit boundary and cost half the
+# expected saving. Named bands put boundaries only where a bet changes, so jitter
+# has to land near one of five specific numbers instead of near any multiple.
+WIND_BANDS_KPH = (16.0, 26.0, 40.0)        # ~10 / 16 / 25 mph: breezy, kicking, chaos
+GUST_BANDS_KPH = (32.0, 48.0, 64.0)
+TEMP_BANDS_C = (-5.0, 4.0, 15.0, 27.0)     # freezing, cold, mild, hot
+PRECIP_BANDS_MM = (0.2, 2.5, 10.0)         # dry, spitting, wet, soaked
+SNOW_BANDS_MM = (0.2, 2.5, 10.0)
+
+
+def _band(value: Any, edges: tuple[float, ...]) -> Any:
+    """Which band a reading falls in, or None if it is missing or unparseable.
+
+    None rather than a default: unknown weather must not hash the same as known
+    weather, because the prompt treats 'no forecast available' differently from a
+    forecast and so should the cache.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return sum(1 for e in edges if v >= e)
+
+
+def _weather_key(weather: dict | None) -> Any:
+    """Weather at the resolution that changes a betting decision, and no finer.
+
+    The raw snapshot is floats that tick on every refresh — 11.2C becomes 11.4C
+    and nothing about the bet is different. Hashing those would invalidate the
+    whole board four to twenty-four times a day for no reason.
+    """
+    if not weather:
+        return None
+    return {
+        "temp": _band(weather.get("temp_c"), TEMP_BANDS_C),
+        "wind": _band(weather.get("wind_kph"), WIND_BANDS_KPH),
+        "gust": _band(weather.get("wind_gust_kph"), GUST_BANDS_KPH),
+        "precip": _band(weather.get("precip_mm"), PRECIP_BANDS_MM),
+        "snow": _band(weather.get("snow_mm"), SNOW_BANDS_MM),
+    }
+
+
+def review_fingerprint(pick: dict, ctx: dict) -> str:
+    """A digest of everything the verdict depends on, and nothing else.
+
+    **Why not just hash the prompt.** The prompt is the complete input, so hashing
+    it would be the obviously correct thing — except it embeds the raw line-movement
+    series with per-quote timestamps, which changes on nearly every odds poll. The
+    hit rate would be near zero and the bill unchanged.
+
+    So this hashes the *decision-relevant* projection of the prompt: the bet itself,
+    the situational facts, and the movement summary **as classified** — direction,
+    significance, and delta to the whole point. That mirrors what the prompt actually
+    instructs the model to use ("Use the stated NET MOVE line; do not do your own
+    arithmetic on the individual quotes"), so the cache and the reviewer are keyed on
+    the same thing.
+
+    **The direction of danger.** A fingerprint that changes too often wastes money.
+    One that changes too rarely stops reviewing picks and says nothing about it —
+    far worse, and invisible. Every judgement call here is therefore biased toward
+    changing: unknown weather hashes as None rather than being dropped, and any
+    field that cannot be parsed falls back to its raw value.
+    """
+    move = _net_move_parts(pick, ctx.get("recent_line_moves") or [])
+    payload = {
+        # the bet
+        "market": pick.get("market_type"),
+        "side": str(pick.get("side") or "").lower(),
+        "line": pick.get("line"),
+        # situational facts, order-independent
+        "injuries": sorted(
+            f"{i.get('team')}|{i.get('player_name')}|{i.get('game_status')}"
+            f"|{i.get('practice_status')}"
+            for i in ctx.get("injuries") or []),
+        "inactives": sorted(
+            f"{i.get('team')}|{i.get('player_name')}"
+            for i in ctx.get("inactives") or []),
+        "weather": _weather_key(ctx.get("weather")),
+        # movement, classified rather than raw
+        "move": None if move is None else {
+            "against": move["against"],
+            "size": move["size"],
+            "delta": round(move["delta"]),
+        },
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
 
 def _prompt(pick: dict, ctx: dict) -> str:
@@ -370,9 +486,14 @@ def review_pick(pick: dict, ctx: dict | None = None) -> dict:
             "source": "model"}
 
 
-def review_slate(picks: list[dict]) -> dict:
-    """Review a whole slate, building game context once per game."""
-    contexts: dict[str, dict] = {}
+def review_slate(picks: list[dict], contexts: dict[str, dict] | None = None) -> dict:
+    """Review a whole slate, building game context once per game.
+
+    `contexts` may be supplied by a caller that has already built them — the
+    fingerprint needs the same context the review does, and building it twice
+    would double the database work and risk the two disagreeing.
+    """
+    contexts = {} if contexts is None else contexts
     results: dict[int, dict] = {}
     counts = {"OK": 0, "FLAG": 0, "KILL": 0}
     # "all OK" is ambiguous: it looks the same whether the model reviewed every
@@ -408,20 +529,63 @@ def review_slate(picks: list[dict]) -> dict:
             "errors": errors}
 
 
-def apply_to_picks(limit: int = 60) -> dict:
+def apply_to_picks(limit: int = 60, force: bool = False) -> dict:
     """Review pending published picks and write verdicts back.
 
     Downgrade only: a FLAG caps a pick at tier B, a KILL unpublishes it. Nothing
     here can raise a tier or publish something that was not already published.
-    """
-    picks = [dict(r) for r in query(
-        "SELECT pick_id, game_id, market_type, side, line, tier, headline "
-        "FROM picks WHERE result='pending' AND ai_verdict IN ('OK','') "
-        "ORDER BY edge_pct DESC LIMIT ?", (limit,))]
-    if not picks:
-        return {"reviewed": 0, "counts": {}, "changed": 0}
 
-    out = review_slate(picks)
+    **Only reviews what has changed.** This function previously selected picks
+    already marked OK and wrote OK back, so each one stayed selected forever and
+    was re-reviewed on every odds poll — about 600 times over a pick's life, plus
+    through the game itself, since `result` stays 'pending' until grading at
+    03:30. Now each candidate's `review_fingerprint` is compared to the stored
+    `review_hash`, and an identical digest means an identical question, so the
+    stored verdict stands.
+
+    `force=True` reviews everything regardless, for prompt changes — a new prompt
+    is a new question that the fingerprint, which covers inputs rather than the
+    prompt text, cannot see. Bump it deliberately after editing `SYSTEM`.
+    """
+    rows = query(
+        "SELECT p.pick_id, p.game_id, p.market_type, p.side, p.line, p.tier, "
+        "       p.headline, p.review_hash, p.ai_verdict "
+        "FROM picks p LEFT JOIN games g ON g.game_id = p.game_id "
+        "WHERE p.result='pending' AND p.ai_verdict IN ('OK','') "
+        # A started game is not actionable, so reviewing it cannot change an
+        # outcome. Grading runs at 03:30, which left every Sunday pick being
+        # re-reviewed through its own game and overnight.
+        "  AND (g.kickoff_utc IS NULL OR datetime(g.kickoff_utc) > datetime('now')) "
+        "ORDER BY p.edge_pct DESC LIMIT ?", (limit,))
+    candidates = [dict(r) for r in rows]
+    if not candidates:
+        return {"reviewed": 0, "counts": {}, "changed": 0, "skipped": 0}
+
+    # Context is needed to fingerprint, and needed again to review. Build once.
+    contexts: dict[str, dict] = {}
+    picks: list[dict] = []
+    fingerprints: dict[int, str] = {}
+    skipped = 0
+    for p in candidates:
+        gid = p["game_id"]
+        if gid not in contexts:
+            contexts[gid] = _game_context(gid)
+        fp = review_fingerprint(p, contexts[gid])
+        fingerprints[p["pick_id"]] = fp
+        # NULL hash means never reviewed, and must always be reviewed. Unknown
+        # errs toward asking: the dangerous failure here is a cache that stops
+        # reviewing quietly.
+        if not force and p["review_hash"] and p["review_hash"] == fp:
+            skipped += 1
+            continue
+        picks.append(p)
+
+    if not picks:
+        log.info("redteam: nothing changed, %d picks skipped, 0 API calls", skipped)
+        return {"reviewed": 0, "counts": {}, "changed": 0, "skipped": skipped,
+                "ai_ran": False, "reviewed_by_model": 0}
+
+    out = review_slate(picks, contexts)
     changed = 0
     with db() as conn:
         for p in picks:
@@ -432,14 +596,22 @@ def apply_to_picks(limit: int = 60) -> dict:
             elif r["verdict"] == "FLAG" and p["tier"] == "A":
                 new_tier = "B"        # cap, never raise
 
+            # **Only a real review earns a cache entry.** A fail-open OK — budget
+            # exhausted, API down, no context — is the absence of an answer, not
+            # an answer. Storing its fingerprint would mark the pick reviewed and
+            # suppress every future attempt, turning a transient outage into a
+            # permanent silent non-review. That is 9 September with a memory.
+            real = r.get("source") == "model"
             conn.execute(
                 "UPDATE picks SET ai_verdict=?, ai_reason=?, tier=?"
                 + (", published=?" if published is not None else "")
+                + (", review_hash=?, reviewed_at=?" if real else "")
                 + " WHERE pick_id=?",
                 ([r["verdict"], (r["reason"] + (" | " + r["evidence"]
                                                 if r["evidence"] else ""))[:500],
                   new_tier]
                  + ([published] if published is not None else [])
+                 + ([fingerprints[p["pick_id"]], utcnow()] if real else [])
                  + [p["pick_id"]]))
             if r["verdict"] != "OK":
                 changed += 1
@@ -451,10 +623,15 @@ def apply_to_picks(limit: int = 60) -> dict:
                     "Check the reasons; a model objecting to most bets is "
                     "usually reacting to thin context, not real problems.",
                     downgrade_rate * 100)
-    log.info("redteam: %s across %d games, %d downgraded (ai_ran=%s, sources=%s)",
-             out["counts"], out["games"], changed, out["ai_ran"], out["sources"])
+    log.info("redteam: %s across %d games, %d downgraded, %d skipped unchanged "
+             "(ai_ran=%s, sources=%s)",
+             out["counts"], out["games"], changed, skipped,
+             out["ai_ran"], out["sources"])
     return {"reviewed": out["reviewed"], "games": out["games"],
             "counts": out["counts"], "changed": changed,
+            # Reported so the saving is observable. A cache whose hit rate you
+            # cannot see is indistinguishable from a reviewer that stopped.
+            "skipped": skipped,
             "ai_ran": out["ai_ran"], "reviewed_by_model": out["reviewed_by_model"],
             "sources": out["sources"], "errors": out.get("errors", []),
             "results": out["results"]}

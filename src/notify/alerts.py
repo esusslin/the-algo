@@ -58,8 +58,18 @@ def check_ai_layer() -> Check | None:
     `complete()` *before* `_log_call`, so no row lands in `ai_calls`. Meanwhile
     `apply_to_picks` catches `AIUnavailable`, returns OK, and the job records success.
 
-    So: the job ran, and the ledger is empty. That pair means every call failed, and it
-    is invisible in every other signal we have.
+    **Why this is no longer "job ran + empty ledger".** That was the right detector
+    until review caching landed. Now a perfectly healthy system makes zero API calls
+    for hours at a time, because nothing that feeds a verdict has moved — so call
+    volume stopped being evidence of anything and the old rule would have become a
+    permanent false alarm. A permanent false alarm is how a monitor gets muted, and a
+    muted monitor is worse than none.
+
+    So it keys on the symptom instead of the mechanism: **are there live picks that
+    nobody has reviewed?** `review_hash` is written only when a review actually
+    reached the model, so NULL means genuinely unreviewed regardless of why. That
+    covers the original outage and every future cause of one, including a cache bug
+    of our own making.
 
     Silent when the flag is off — a disabled feature is not an outage.
     """
@@ -74,20 +84,30 @@ def check_ai_layer() -> Check | None:
         return None  # never run — that is a freshness problem, not an AI problem
 
     since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(timespec="seconds")
-    calls = query(
-        "SELECT COUNT(*) AS n FROM ai_calls WHERE agent='redteam' AND created_at >= ?",
-        (since,),
+    if ran[0]["finished_at"] < since:
+        return None  # stale job; check_stale_jobs owns that, and two alerts per
+        # cause is how an alert becomes noise
+
+    # Published, still pending, not yet kicked off — i.e. a bet a user can still
+    # place — and never successfully reviewed.
+    unreviewed = query(
+        "SELECT COUNT(*) AS n FROM picks p LEFT JOIN games g ON g.game_id = p.game_id "
+        "WHERE p.result='pending' AND p.published=1 AND p.review_hash IS NULL "
+        "  AND (g.kickoff_utc IS NULL OR datetime(g.kickoff_utc) > datetime('now'))"
     )
-    n = int(calls[0]["n"]) if calls else 0
-    recent_run = ran[0]["finished_at"] >= since
-    if recent_run and n == 0:
+    n_unreviewed = int(unreviewed[0]["n"]) if unreviewed else 0
+    if n_unreviewed:
+        calls = query(
+            "SELECT COUNT(*) AS n FROM ai_calls WHERE agent='redteam' "
+            "AND created_at >= ?", (since,))
+        n_calls = int(calls[0]["n"]) if calls else 0
         return Check(
             "ai_down",
             True,
-            "red team ran but made 0 API calls in 6h — key, balance or model. "
-            "Picks are publishing UNREVIEWED.",
+            f"{n_unreviewed} live picks UNREVIEWED after a red-team run "
+            f"({n_calls} API calls in 6h) — check key, balance or model.",
         )
-    return Check("ai_down", False, f"{n} redteam calls in 6h")
+    return Check("ai_down", False, "no unreviewed live picks")
 
 
 def check_credit_ladder() -> Check | None:

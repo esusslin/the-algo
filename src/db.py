@@ -569,6 +569,29 @@ MIGRATIONS: list[tuple[int, str]] = [
         last_sent   TEXT
     );
     """),
+
+    (9, """
+    -- Red-team review cache key.
+    --
+    -- `apply_to_picks` selected picks whose verdict was already OK and wrote OK
+    -- back, so every OK pick stayed in the selection set permanently and was
+    -- re-reviewed on every odds poll — every 5 minutes, through the game, until
+    -- grading at 03:30. A pick created Friday for a Sunday game was reviewed
+    -- roughly 600 times. Between 9 and 13 September 2026 that cost $63 to
+    -- re-derive answers we already had.
+    --
+    -- `review_hash` is a digest of every input the verdict actually depends on:
+    -- the pick's own line and side, the injury and inactive lists, bucketed
+    -- weather, and the CLASSIFIED net line move. Unchanged digest means an
+    -- identical question, so the stored verdict stands.
+    --
+    -- NULL means never reviewed and must always be reviewed. That default is
+    -- the safe direction: the failure mode of this column is a cache that stops
+    -- reviewing silently, so anything unknown errs toward asking.
+    ALTER TABLE picks ADD COLUMN review_hash TEXT;
+    ALTER TABLE picks ADD COLUMN reviewed_at TEXT;
+    CREATE INDEX IF NOT EXISTS idx_picks_review ON picks(result, ai_verdict);
+    """),
 ]
 
 

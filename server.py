@@ -65,10 +65,28 @@ def _poll_odds() -> None:
         with job_run("generate_picks") as ctx:
             from src.picks.generator import generate
             ctx["rows_affected"] = generate(source="market_engine")["written"]
-        if settings.ENABLE_AI_REDTEAM:
-            with job_run("redteam_review") as ctx:
-                from src.ai.redteam import apply_to_picks
-                ctx["rows_affected"] = apply_to_picks().get("changed", 0)
+
+
+def _redteam_review() -> None:
+    """Review picks whose inputs have changed since they were last reviewed.
+
+    **Its own job, deliberately.** This used to run inside `_poll_odds`, which
+    gave it a 5-minute cadence it never needed — odds freshness is the product,
+    a re-review of an unmoved line is not. Coupled to the poll it inherited 288
+    runs a day and re-reviewed the whole board on each one.
+
+    Now it runs on its own clock and `apply_to_picks` decides internally whether
+    anything is worth asking about. Most runs make zero API calls. The interval
+    is therefore "how long may a new pick sit unreviewed", not "how often should
+    we spend money" — which is the question it should have been answering all
+    along.
+    """
+    if not settings.ENABLE_AI_REDTEAM:
+        return
+    with job_run("redteam_review") as ctx:
+        from src.ai.redteam import apply_to_picks
+        out = apply_to_picks()
+        ctx["rows_affected"] = out.get("changed", 0)
 
 
 def _link_odds_events() -> None:
@@ -171,6 +189,12 @@ JOBS: list[tuple] = [
     # catch stat corrections.
     (_grade, "cron", dict(hour=3, minute=30), "grade_overnight"),
     (_grade, "cron", dict(hour=11, minute=0), "grade_morning"),
+
+    # Red team on its own clock, no longer inside the odds poll. 15 minutes is a
+    # cap on how long a newly generated pick can sit unreviewed, NOT a spend
+    # rate: apply_to_picks fingerprints each candidate and makes zero API calls
+    # when nothing that feeds a verdict has moved.
+    (_redteam_review, "interval", dict(minutes=15), "redteam_review"),
 
     (_health_heartbeat, "interval", dict(minutes=30), "heartbeat"),
 
