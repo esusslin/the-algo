@@ -73,6 +73,23 @@ def thresholds_for(market_type: str, tier: str) -> dict:
 MAX_CREDIBLE_DISPERSION = 0.15
 
 
+def loosest_min_books() -> int:
+    """The smallest book count any tier of any market class would accept.
+
+    Used as the pre-filter for `find_opportunities`, which runs before market
+    class is known. Anything stricter there pre-empts `assign_tier` and makes
+    the per-class scaling unreachable — which is precisely how props went from
+    20,000 collected quotes to zero published picks in silence.
+
+    Derived from the same tables `thresholds_for` reads, so loosening a class
+    cannot leave this behind.
+    """
+    return min(
+        max(4, round(TIER_RULES["C"]["min_books"] * scale))
+        for scale in CLASS_BOOK_SCALE.values()
+    )
+
+
 def assign_tier(opp: dict) -> str | None:
     """A/B/C, or None if it doesn't clear the bar for its market class."""
     if (opp.get("dispersion") or 0) > MAX_CREDIBLE_DISPERSION:
@@ -191,7 +208,19 @@ def generate(source: str = "market_engine",
     if min_edge is None:
         min_edge = max(TIER_RULES["C"]["min_edge"], settings.MIN_EDGE_PCT)
 
-    opps = find_opportunities(min_edge=min_edge)
+    # `find_opportunities` applies its own `min_books` BEFORE anything knows what
+    # class the market is, and its default of 8 is a GAME-market number. Props
+    # are quoted by far fewer books — the live ceiling is 7 and the median is 5 —
+    # so that default silently discarded every prop in the system before
+    # `assign_tier` could apply the scaled rule that exists for exactly this
+    # reason. 20,000 prop quotes collected, 6,900 priced, 56 clearing the edge
+    # floor, and zero picks written, with no error anywhere.
+    #
+    # So pass the LOOSEST bar any class could accept, and let `assign_tier` be
+    # the single place that decides what "enough books" means per class. Derived
+    # rather than hardcoded, because two independent definitions of the same
+    # threshold is what caused this.
+    opps = find_opportunities(min_edge=min_edge, min_books=loosest_min_books())
     if not opps:
         log.info("no opportunities at >= %.1f%% edge", min_edge)
         return {"found": 0, "tiered": 0, "written": 0, "by_tier": {}}
