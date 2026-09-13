@@ -463,14 +463,36 @@ def poll(force_tier: str | None = None) -> dict[str, int]:
     totals = {"seen": 0, "written": 0, "changed": 0,
               "unmapped_events": 0, "unmapped_players": 0, "calls": 0}
 
+    # UPCOMING MEANS NOT YET STARTED.
+    #
+    # `status != 'final'` is not the same test, and the difference disabled the
+    # entire adaptive throttle. A game that kicked off and was never marked
+    # final stayed in this set forever, so `min()` returned a NEGATIVE
+    # hours-to-kickoff — live on 13 September it read -62.3h, still pointing at
+    # Thursday night while Sunday's 1pm games were two hours away.
+    #
+    # `interval_minutes` walks its buckets in ascending order and returns the
+    # first whose bound is >= the value, so any negative number always matches
+    # the tightest bucket. Every tier therefore polled at its maximum rate all
+    # season, and reported `ok interval=5m soonest=-62.3h` while doing it.
+    #
+    # The cost is real: the whole point of the tier schedule is to poll a market
+    # rarely when kickoff is days out. Burn rate was tracking ~230k credits a
+    # month against a 100k budget, and the credit ladder sheds PROPS first.
     upcoming = query(
         "SELECT game_id, kickoff_utc FROM games WHERE season=? AND status!='final' "
-        "AND kickoff_utc IS NOT NULL", (settings.CURRENT_SEASON,)
+        "AND kickoff_utc IS NOT NULL AND datetime(kickoff_utc) > datetime('now')",
+        (settings.CURRENT_SEASON,)
     )
     if not upcoming:
         log.info("no upcoming games — nothing to poll")
         return totals
     soonest = min(_hours_to_kick(g["kickoff_utc"]) for g in upcoming)
+    if soonest < 0:
+        # Cannot happen given the filter above; asserted rather than assumed
+        # because the failure is silent over-polling, not an error.
+        log.error("soonest kickoff is %.1fh in the past — the upcoming filter "
+                  "is not doing its job", soonest)
 
     for tier in TIERS:
         if force_tier and tier.name != force_tier:
