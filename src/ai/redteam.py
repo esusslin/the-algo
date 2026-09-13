@@ -85,10 +85,29 @@ def _game_context(game_id: str) -> dict[str, Any]:
         return {}
     g = dict(g[0])
 
+    # ONE ROW PER PLAYER, the most recently learned.
+    #
+    # `injuries` has no primary key and no unique constraint, so every fetch
+    # appends. Read naively it hands the agent the same player several times
+    # with CONTRADICTORY statuses — live on 13 September it showed one
+    # quarterback as both "Questionable" and "Out" in a single list, and the
+    # 25-row limit was being consumed by duplicates of two players while the
+    # rest of the team went unmentioned.
+    #
+    # An agent told a player is simultaneously out and questionable will write
+    # whichever it read last into `evidence`, and that evidence is what makes a
+    # KILL trustworthy. `knowledge_time` exists precisely so the latest thing we
+    # learned wins; nothing was using it.
     injuries = [dict(r) for r in query(
+        "WITH latest AS ("
+        "  SELECT player_name, team, game_status, practice_status, body_part,"
+        "         ROW_NUMBER() OVER ("
+        "           PARTITION BY COALESCE(player_id, player_name)"
+        "           ORDER BY knowledge_time DESC, rowid DESC) AS rn"
+        "  FROM injuries WHERE season=? AND week=? AND team IN (?,?)"
+        "    AND game_status IS NOT NULL)"
         "SELECT player_name, team, game_status, practice_status, body_part "
-        "FROM injuries WHERE season=? AND week=? AND team IN (?,?) "
-        "AND game_status IS NOT NULL "
+        "FROM latest WHERE rn = 1 "
         "ORDER BY CASE game_status WHEN 'Out' THEN 1 WHEN 'Doubtful' THEN 2 "
         "WHEN 'Questionable' THEN 3 ELSE 4 END LIMIT 25",
         (g.get("season"), g.get("week"), g.get("home_team"), g.get("away_team")))]
