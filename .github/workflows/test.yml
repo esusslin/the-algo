@@ -33,6 +33,12 @@ jobs:
       - name: Pick ordering (JS)
         run: node tests/js/sort_picks.mjs
 
+      # Product rule with teeth: the app must not know, ask, store or opine on
+      # anyone's bankroll. Easy to reintroduce by accident one helpful commit at
+      # a time, so it is asserted rather than remembered.
+      - name: No bankroll in the UI
+        run: node tests/js/no_bankroll.mjs
+
       # Railway deploys on push regardless of CI, so this is a signal rather
       # than a gate. If you want it to block, enable "Wait for CI" in the
       # Railway service settings.

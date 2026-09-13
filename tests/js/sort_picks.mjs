@@ -29,13 +29,13 @@ const { SORTS, winProb } = await import(
 // TBD deliberately has no kickoff and the best numbers, so a sort that mishandles
 // null can't hide behind also being last on merit.
 const PICKS = [
-  { id: "CIN", blended_prob: 0.533, edge_pct: 6.5, kelly_units: 0.010, tier: "B",
+  { id: "CIN", blended_prob: 0.533, edge_pct: 6.5, tier: "B",
     kickoff_utc: "2026-09-13T17:00:00+00:00" },
-  { id: "LV",  blended_prob: 0.640, edge_pct: 5.6, kelly_units: 0.012, tier: "B",
+  { id: "LV",  blended_prob: 0.640, edge_pct: 5.6, tier: "B",
     kickoff_utc: "2026-09-13T20:05:00+00:00" },
-  { id: "DET", blended_prob: 0.399, edge_pct: 5.4, kelly_units: 0.004, tier: "A",
+  { id: "DET", blended_prob: 0.399, edge_pct: 5.4, tier: "A",
     kickoff_utc: "2026-09-13T17:00:00+00:00" },
-  { id: "TBD", blended_prob: 0.700, edge_pct: 9.9, kelly_units: 0.020, tier: "C",
+  { id: "TBD", blended_prob: 0.700, edge_pct: 9.9, tier: "C",
     kickoff_utc: null },
 ];
 
@@ -59,7 +59,9 @@ t("best chance ranks by win probability", by("win"), ["TBD", "LV", "CIN", "DET"]
 t("best value ranks by edge", by("edge"), ["TBD", "CIN", "LV", "DET"]);
 t("kickoff ties break by win%, unknown kickoff sorts LAST",
   by("time"), ["CIN", "DET", "LV", "TBD"]);
-t("biggest stake ranks by kelly_units", by("stake"), ["TBD", "LV", "CIN", "DET"]);
+// "Biggest stake" was removed: the app no longer suggests a size, so ordering
+// by one would be ranking picks on advice it has stopped giving.
+t("no stake sort exists", SORTS.some((s) => s.key === "stake"), false);
 t("tier puts A first", by("tier"), ["DET", "LV", "CIN", "TBD"]);
 
 // Sorting must not reorder the array the day-chips count from.
