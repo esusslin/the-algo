@@ -220,11 +220,19 @@ def generate(source: str = "market_engine",
     # the single place that decides what "enough books" means per class. Derived
     # rather than hardcoded, because two independent definitions of the same
     # threshold is what caused this.
-    opps = find_opportunities(min_edge=min_edge, min_books=loosest_min_books())
-    if not opps:
-        log.info("no opportunities at >= %.1f%% edge", min_edge)
+    # Priced WITHOUT an edge floor, then filtered here.
+    #
+    # The floor cannot be applied at the query, because a pick whose edge has
+    # collapsed since it was created would simply be absent from the results —
+    # and absent is exactly the case that needs repricing. Filtering a market out
+    # for having a bad price is the same as never noticing its price went bad.
+    all_opps = find_opportunities(min_edge=-100.0, min_books=loosest_min_books())
+    if not all_opps:
+        log.info("no priced markets at all")
         return {"found": 0, "tiered": 0, "written": 0, "by_tier": {}}
 
+    # New picks come only from markets clearing the floor AND earning a tier.
+    opps = [o for o in all_opps if o["edge_pct"] >= min_edge]
     tiered = []
     for o in opps:
         tier = assign_tier(o)
@@ -233,14 +241,23 @@ def generate(source: str = "market_engine",
 
     sized = size_slate(tiered, bankroll=bankroll)
 
+    # Everything currently priced, keyed for the reprice pass below. A pick whose
+    # market has vanished from the feed entirely is left untouched rather than
+    # withdrawn: absence of a quote is not evidence the bet went bad, and
+    # withdrawing on a transient feed gap would flicker the board.
+    priced = {(o["game_id"], o["market_type"], o["player_id"], o["side"], o["line"]): o
+              for o in all_opps}
+
     by_tier: dict[str, int] = {}
-    written = 0
+    written = repriced = withdrawn = 0
     now = utcnow()
 
     if not dry_run:
         with db() as conn:
             for p in sized:
-                # don't re-publish the same market within the same pass
+                # A market that already has a pending pick is handled by the
+                # reprice pass below, not here. Inserting a second row for the
+                # same bet would double it in the UI and in the history.
                 dup = conn.execute(
                     "SELECT pick_id FROM picks WHERE game_id=? AND market_type=? "
                     "AND player_id=? AND side=? AND line=? AND result='pending'",
@@ -273,14 +290,60 @@ def generate(source: str = "market_engine",
                 })
                 written += 1
                 by_tier[p["tier"]] = by_tier.get(p["tier"], 0) + 1
+
+            # ---- reprice every pending pick against the current market ----
+            #
+            # Without this a pick is frozen at the numbers it was born with.
+            # Markets move all day; the pick did not. Live on 13 September, 19
+            # of 74 published picks showed a positive edge in the UI while their
+            # current edge was NEGATIVE — one displayed 5.6% on a bet that had
+            # become -3.1%. No job failed and nothing looked wrong, and the
+            # stale number is the one a user acts on.
+            #
+            # Repricing can only ever WITHDRAW, never promote:
+            #   * tier is untouched, so a red-team FLAG that capped it holds
+            #   * an unpublished pick is never published by a reprice
+            #   * a pick that stops clearing its class bar is pulled from view
+            # Anything that would raise confidence needs a fresh pick and a
+            # fresh review.
+            for row in conn.execute(
+                    "SELECT pick_id, game_id, market_type, player_id, side, line, "
+                    "edge_pct, published FROM picks WHERE result='pending'"
+            ).fetchall():
+                cur = priced.get((row["game_id"], row["market_type"],
+                                  row["player_id"], row["side"], row["line"]))
+                if cur is None:
+                    continue  # market not quoted right now; absence is not a verdict
+                still = assign_tier(cur) is not None
+                bp = blended_probability(cur)
+                headline, detail = describe(cur)
+                keep = 1 if (row["published"] and still) else 0
+                conn.execute(
+                    "UPDATE picks SET best_book=?, best_price=?, fair_prob=?, "
+                    "blended_prob=?, edge_pct=?, headline=?, detail=?, published=? "
+                    "WHERE pick_id=?",
+                    (cur["best_book"], cur["best_price"], cur["fair_prob"],
+                     bp["prob"], cur["edge_pct"], headline, detail, keep,
+                     row["pick_id"]))
+                if row["published"] and not keep:
+                    log.info("withdrew pick %s: edge %.1f%% -> %.1f%%",
+                             row["pick_id"], row["edge_pct"], cur["edge_pct"])
+                    withdrawn += 1
+                else:
+                    repriced += 1
     else:
         for p in sized:
             by_tier[p["tier"]] = by_tier.get(p["tier"], 0) + 1
+
+    if withdrawn:
+        log.warning("withdrew %d picks whose edge no longer clears its tier", withdrawn)
 
     return {
         "found": len(opps),
         "tiered": len(sized),
         "written": written,
+        "repriced": repriced,
+        "withdrawn": withdrawn,
         "by_tier": by_tier,
         "total_exposure": round(sum(p["stake"] for p in sized), 4),
         "picks": sized,
