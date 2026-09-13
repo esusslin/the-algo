@@ -90,9 +90,21 @@ def check_ai_layer() -> Check | None:
 
     # Published, still pending, not yet kicked off — i.e. a bet a user can still
     # place — and never successfully reviewed.
+    #
+    # `ai_verdict IN ('OK','')` mirrors `apply_to_picks` exactly, and without it
+    # this check fires on picks it is wrong about. A FLAG or KILL means the red
+    # team DID review the pick and objected; the agent is downgrade-only, so it
+    # never revisits those. They therefore keep `review_hash` NULL forever and
+    # would be counted as unreviewed for the rest of their lives.
+    #
+    # Found the moment the cache shipped: 46 of 72 live picks had no hash, all
+    # of them verdicts the reviewer had already reached. Alerting on those is
+    # the permanent false alarm this detector was rewritten to avoid — and a
+    # monitor that cries wolf on day one never gets read on day two.
     unreviewed = query(
         "SELECT COUNT(*) AS n FROM picks p LEFT JOIN games g ON g.game_id = p.game_id "
         "WHERE p.result='pending' AND p.published=1 AND p.review_hash IS NULL "
+        "  AND p.ai_verdict IN ('OK','') "
         "  AND (g.kickoff_utc IS NULL OR datetime(g.kickoff_utc) > datetime('now'))"
     )
     n_unreviewed = int(unreviewed[0]["n"]) if unreviewed else 0

@@ -40,7 +40,7 @@ def alert_db(monkeypatch):
         "CREATE TABLE alert_state (alert_key TEXT PRIMARY KEY, firing INTEGER,"
         "  detail TEXT, changed_at TEXT, last_sent TEXT);"
         "CREATE TABLE picks (pick_id INTEGER PRIMARY KEY, game_id TEXT, result TEXT,"
-        "  published INTEGER, review_hash TEXT);"
+        "  published INTEGER, review_hash TEXT, ai_verdict TEXT);"
         "CREATE TABLE games (game_id TEXT PRIMARY KEY, kickoff_utc TEXT);"
     )
 
@@ -65,11 +65,11 @@ def _ran(conn, **kw) -> None:
 
 
 def _pick(conn, pick_id=1, review_hash=None, published=1, result="pending",
-          kickoff="2099-01-01T00:00:00+00:00") -> None:
+          kickoff="2099-01-01T00:00:00+00:00", verdict="OK") -> None:
     gid = f"g{pick_id}"
     conn.execute("INSERT INTO games VALUES (?,?)", (gid, kickoff))
-    conn.execute("INSERT INTO picks VALUES (?,?,?,?,?)",
-                 (pick_id, gid, result, published, review_hash))
+    conn.execute("INSERT INTO picks VALUES (?,?,?,?,?,?)",
+                 (pick_id, gid, result, published, review_hash, verdict))
 
 
 # --- the AI detector -----------------------------------------------------------------
@@ -136,6 +136,35 @@ def test_an_old_run_is_not_an_ai_outage(alert_db) -> None:
     _ran(alert_db, days=3)
     _pick(alert_db, review_hash=None)
     assert check_ai_layer() is None
+
+
+def test_a_flagged_pick_is_not_counted_as_unreviewed(alert_db) -> None:
+    """**Caught in production the hour the cache shipped.**
+
+    A FLAG or KILL means the red team reviewed the pick and objected. The agent
+    is downgrade-only, so `apply_to_picks` never selects those again and they
+    keep `review_hash` NULL for life. Counting them as unreviewed made 46 of 72
+    live picks look unchecked when every one had been checked — a permanent
+    false alarm on the first day, which is how a monitor stops being read."""
+    from src.notify.alerts import check_ai_layer
+
+    _ran(alert_db)
+    _pick(alert_db, 1, review_hash=None, verdict="FLAG")
+    _pick(alert_db, 2, review_hash=None, verdict="KILL")
+    assert check_ai_layer().firing is False
+
+
+def test_a_genuinely_unreviewed_pick_still_fires(alert_db) -> None:
+    """The other half of the pair. Narrowing the query must not make the check
+    blind to the thing it exists for."""
+    from src.notify.alerts import check_ai_layer
+
+    _ran(alert_db)
+    _pick(alert_db, 1, review_hash=None, verdict="FLAG")
+    _pick(alert_db, 2, review_hash=None, verdict="OK")
+    r = check_ai_layer()
+    assert r.firing is True
+    assert "1 live picks" in r.detail, f"counted the FLAG too: {r.detail}"
 
 
 def test_a_disabled_feature_is_not_an_outage(alert_db, monkeypatch) -> None:
