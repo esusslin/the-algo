@@ -29,7 +29,7 @@ from typing import Iterable, Sequence
 
 from src.config import settings
 from src.db import db, query, upsert_rows, utcnow
-from src.market.devig import american_to_prob, devig, edge_pct
+from src.market.devig import american_to_prob, devig, edge_pct, hold_pct
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,13 @@ BOOK_WEIGHTS = {
     "circasports": 3.0,
 }
 DEFAULT_WEIGHT = 1.0
+
+# A two-sided quote whose implied probabilities imply more margin than this is
+# not an expensive price, it is a broken one. Real NFL holds run 2-6% on main
+# markets and up to ~15% on thin props; an exchange posting -10000 on both sides
+# computes to 49.5%. Set well clear of any honest book so this only ever catches
+# the genuinely broken.
+MAX_CREDIBLE_HOLD_PCT = 25.0
 
 
 def _pair_line(market_type: str, side: str, line: float) -> float:
@@ -115,6 +122,7 @@ def build_fair_prices(method: str | None = None,
     # per (game, market, player, line, side) -> list of (fair_prob, weight, is_sharp)
     agg: dict[tuple, list[tuple[float, float, bool]]] = defaultdict(list)
     unpaired = 0
+    implausible = 0
 
     for (game_id, mkt, pid, cline, book), sides in grouped.items():
         if len(sides) < 2:
@@ -125,9 +133,32 @@ def build_fair_prices(method: str | None = None,
             unpaired += 1
             continue
         a, b = pair
+        raw = [american_to_prob(sides[a]), american_to_prob(sides[b])]
+
+        # **Reject a broken quote before it becomes a vote.**
+        #
+        # Found live on 13 September: an exchange was posting -10000 on BOTH
+        # sides of a moneyline. That is a 49.5% hold, which is not a price — it
+        # is a market with no liquidity, or a parse error. Devig cannot tell the
+        # difference: it happily normalises it to a clean 50/50 and hands back
+        # something that looks exactly like a real opinion.
+        #
+        # Two ways that hurts, both silent. It drags the weighted median toward
+        # a coin flip, which INFLATES the apparent edge on the underdog side of
+        # a lopsided game. And it increments `book_count`, which is how picks
+        # clear tier thresholds — so a broken quote both manufactures the edge
+        # and helps it qualify.
+        #
+        # The red-team agent caught this one before any code did, by objecting
+        # to "odd line movement showing both moneylines at -10000". That is the
+        # agent doing exactly its job, and it should not have been the only
+        # thing standing between a fake edge and the feed.
+        if hold_pct(raw) > MAX_CREDIBLE_HOLD_PCT:
+            implausible += 1
+            continue
+
         try:
-            fair = devig([american_to_prob(sides[a]), american_to_prob(sides[b])],
-                         method=method)
+            fair = devig(raw, method=method)
         except (ValueError, ZeroDivisionError):
             continue
         w = BOOK_WEIGHTS.get(book, DEFAULT_WEIGHT)
@@ -161,9 +192,15 @@ def build_fair_prices(method: str | None = None,
         upsert_rows(conn, "fair_prices", out,
                     key_cols=["game_id", "market_type", "player_id", "side", "line"])
 
-    if unpaired:
-        log.info("fair_prices: %d rows (%d one-sided book quotes skipped)",
-                 len(out), unpaired)
+    if unpaired or implausible:
+        log.info("fair_prices: %d rows (%d one-sided, %d implausible-hold quotes skipped)",
+                 len(out), unpaired, implausible)
+    # Loud, not just logged: a book that suddenly starts posting garbage on every
+    # market is a feed problem, and the shape of it is a spike in this number.
+    if implausible > 20:
+        log.warning("fair_prices: %d quotes rejected for implausible hold (>%.0f%%) "
+                    "— check whether a book or the parser has broken",
+                    implausible, MAX_CREDIBLE_HOLD_PCT)
     return len(out)
 
 
