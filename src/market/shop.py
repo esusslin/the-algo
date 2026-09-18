@@ -22,6 +22,15 @@ from src.market.devig import american_to_decimal, edge_pct
 
 log = logging.getLogger(__name__)
 
+# Above this, the "edge" is a data problem rather than a betting opportunity.
+#
+# Genuine soft-book edges in NFL run 1-10%. A book quoting a price implying 15%
+# where twenty others say 47% is not offering value — it is quoting a different
+# event. Set far above any real edge so this only ever catches the impossible,
+# and deliberately NOT tunable from config: lowering it to "find more picks"
+# would defeat the entire point.
+MAX_PLAUSIBLE_EDGE_PCT = 25.0
+
 
 def best_prices(game_id: str | None = None) -> dict[tuple, tuple[str, int]]:
     """(game, market, player, side, line) -> (best_book, best_price).
@@ -105,6 +114,7 @@ def find_opportunities(min_edge: float | None = None,
         params = [game_id]
 
     out: list[dict] = []
+    implausible: list[tuple] = []
     for r in query(sql, params):
         if r["book_count"] < min_books:
             continue
@@ -133,6 +143,31 @@ def find_opportunities(min_edge: float | None = None,
         e = edge_pct(anchor, price)
         if e < min_edge:
             continue
+
+        # AN EDGE THIS LARGE IS EVIDENCE OF BAD DATA, NOT AN OPPORTUNITY.
+        #
+        # Found live on 18 September 2026. DraftKings listed `home -1.5 at +544`
+        # and paired it with `away +1.5 at -830`. Those imply 15.5% and 89.3%,
+        # summing to 1.048 — a perfectly ordinary 4.6% hold, so the implausible-
+        # hold guard passed it. Twenty other books priced the same side between
+        # -110 and +105, putting the weighted median at 47.2%.
+        #
+        # `best_prices` takes MAX(price), so the outlier always wins, and the
+        # arithmetic then reports 0.4715 * 5.44 - 0.5285 = 203.6% edge. The
+        # pipeline was working exactly as designed on a quote it should have
+        # distrusted. 23 of 79 published picks were this, one showing 2573%.
+        #
+        # The asymmetry that makes this safe: a book quoting 15% where the market
+        # says 47% is not offering you money, it is quoting a different event —
+        # a stale alternate line, a mislabelled market, a typo. You will not get
+        # filled. Real soft-book edges in NFL run 1-10%; the threshold sits far
+        # above that so it only ever catches the impossible.
+        #
+        # Skipped rather than clamped, deliberately: a clamped edge would still
+        # publish a pick at a price nobody is offering.
+        if e > MAX_PLAUSIBLE_EDGE_PCT:
+            implausible.append((r["market_type"], r["side"], r["line"], book, price, e))
+            continue
         out.append({
             "game_id": r["game_id"], "market_type": r["market_type"],
             "player_id": r["player_id"], "side": r["side"], "line": r["line"],
@@ -146,6 +181,18 @@ def find_opportunities(min_edge: float | None = None,
             "dispersion": r["dispersion"],
             "decimal": american_to_decimal(price),
         })
+    if implausible:
+        # Loud, and with the evidence attached. A book that starts posting
+        # nonsense across a slate is a feed problem, and its shape is a spike in
+        # this count — but the individual quotes are what let you tell a stale
+        # alt line from a mislabelled market.
+        log.warning("discarded %d quote(s) with an implausible edge (>%.0f%%) — "
+                    "these are bad data, not opportunities", len(implausible),
+                    MAX_PLAUSIBLE_EDGE_PCT)
+        for mkt, side, line, book, price, e in sorted(
+                implausible, key=lambda x: -x[5])[:5]:
+            log.warning("  %s %s line=%s %+d (%s) -> %.0f%% edge",
+                        mkt, side, line, price, book, e)
     return sorted(out, key=lambda x: -x["edge_pct"])
 
 

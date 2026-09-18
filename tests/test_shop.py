@@ -234,7 +234,10 @@ def test_no_bettable_book_means_no_pick(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_results_are_sorted_by_edge_descending(monkeypatch: pytest.MonkeyPatch) -> None:
     """The slate is truncated downstream, so ordering decides which bets survive."""
-    odds = [row(side="home", price=150, book="dk"), row(side="away", price=300, book="fd")]
+    # Realistic soft-book prices. The original fixture used +150/+300, which at
+    # a 50% fair probability are 25% and 100% edges — the implausible-edge guard
+    # now discards those as bad data, which is the point of it.
+    odds = [row(side="home", price=115, book="dk"), row(side="away", price=125, book="fd")]
     fairs = [fair(side="home", fair_prob=0.5, book_count=12),
              fair(side="away", fair_prob=0.5, book_count=12)]
     found = opportunities(monkeypatch, odds, fairs, main_line_only=False)

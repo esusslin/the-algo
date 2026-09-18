@@ -62,7 +62,7 @@ _TIGHT = [(b, s, p) for b in _CONSENSUS for s, p in (("home", -115), ("away", -1
 # Eight books agreeing, plus a ninth paying well over. Eight is not incidental:
 # game-class tier C requires 8 books, so a smaller fixture produces no pick at
 # all and every assertion below would fail for the wrong reason.
-GOOD = _TIGHT + [("betmgm", "home", 145), ("betmgm", "away", -175)]
+GOOD = _TIGHT + [("betmgm", "home", 120), ("betmgm", "away", -145)]
 
 # Same market after the soft book corrects itself. No edge left anywhere.
 CORRECTED = _TIGHT + [("betmgm", "home", -125), ("betmgm", "away", -101)]
@@ -122,12 +122,12 @@ def test_the_displayed_price_and_book_follow_too(gen_db) -> None:
     _quotes(gen_db, GOOD)
     build_fair_prices()
     generate(source="market_engine")
-    assert _pick(gen_db)["best_price"] == 145
+    assert _pick(gen_db)["best_price"] == 120
 
     _quotes(gen_db, CORRECTED)
     build_fair_prices()
     generate(source="market_engine")
-    assert _pick(gen_db)["best_price"] != 145
+    assert _pick(gen_db)["best_price"] != 120
 
 
 # ---------------------------------------------------------------------------

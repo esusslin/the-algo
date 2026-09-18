@@ -57,8 +57,8 @@ def _seed_priceable_prop(db_mod, books: list[str], over: int, under: int) -> Non
     for b in books:
         _quote(db_mod, b, "over", over)
         _quote(db_mod, b, "under", under)
-    _quote(db_mod, "betmgm", "over", 130)      # the outlier we want to bet
-    _quote(db_mod, "betmgm", "under", -160)
+    _quote(db_mod, "betmgm", "over", 118)      # the outlier we want to bet
+    _quote(db_mod, "betmgm", "under", -138)
 
 
 # ---------------------------------------------------------------------------
