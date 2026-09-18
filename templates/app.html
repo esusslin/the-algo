@@ -706,8 +706,13 @@ function algo(){return{
   showWhy:null, rtVerdicts:[], rtHigh:false, day:'all', showGlossary:false,
   // Restored from the last visit: a sort is a preference, and making
   // someone re-pick it on every load is how a control stops being used.
-  sort:(()=>{ try{ return localStorage.getItem('algo.sort') || 'win' }
-              catch(e){ return 'win' } })(),
+  // Default is VALUE, not chance. Best-chance ranks by win probability, which
+  // puts -900 favourites at the top — live on 20 September the first card was a
+  // -900 with -0.0% edge. Price discrepancy is the product; win probability is
+  // something the market has already priced. Best chance stays available for
+  // anyone who wants it, it is just not the first thing anyone sees.
+  sort:(()=>{ try{ return localStorage.getItem('algo.sort') || 'edge' }
+              catch(e){ return 'edge' } })(),
 
   // ---- glossary ---------------------------------------------------------
   // Terms live in one place and are selected per tab. Defining "units" once in
@@ -797,7 +802,11 @@ function algo(){return{
     // Every comparator falls back to win probability, so two picks that tie on
     // the chosen number still land in a stable, meaningful order rather than
     // whatever order the API happened to return.
-    return [...list].sort((a,b)=> s.cmp(a,b) || (winProb(b) - winProb(a)));
+    // Withdrawn picks sink, whatever the sort. Admins see them (users do not),
+    // and a dark pick at the top of the board makes a working system look broken.
+    return [...list].sort((a,b)=>
+      ((a.published ? 0 : 1) - (b.published ? 0 : 1))
+      || s.cmp(a,b) || (winProb(b) - winProb(a)));
   },
   sortHint(){
     return (this.SORTS.find(x=>x.key===this.sort) || this.SORTS[0]).hint;

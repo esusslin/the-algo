@@ -39,6 +39,9 @@ jobs:
       - name: No bankroll in the UI
         run: node tests/js/no_bankroll.mjs
 
+      - name: Board ordering (JS)
+        run: node tests/js/board_order.mjs
+
       # Railway deploys on push regardless of CI, so this is a signal rather
       # than a gate. If you want it to block, enable "Wait for CI" in the
       # Railway service settings.
