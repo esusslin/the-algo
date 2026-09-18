@@ -816,7 +816,17 @@ function algo(){return{
     try{ books = (JSON.parse(p.prob_components||'{}').book_count) || 0 }catch(e){}
     const gap = (winProb(p)*100).toFixed(1);
     return (books ? `${books} books say ${gap}%` : `Market says ${gap}%`)
-         + ` · this price is ${p.edge_pct.toFixed(1)}% better than fair`;
+         + ` · ` + edgePhrase(p.edge_pct);
+  },
+  // "this price is -2.2% better than fair" is not a sentence. A repriced pick
+  // can go negative — that is the withdrawal path working — and the copy has to
+  // survive it. Seen live on a -900 favourite reading "-0.0% better than fair",
+  // which manages to be both wrong and meaningless.
+  edgePhrase(edge){
+    const e = Number(edge) || 0;
+    if (Math.abs(e) < 0.05) return 'this price is exactly fair';
+    return e > 0 ? `this price is ${e.toFixed(1)}% better than fair`
+                 : `this price is ${Math.abs(e).toFixed(1)}% WORSE than fair`;
   },
   // Win rate a price needs just to break even, before any edge. Gives the
   // headline probability something to be compared against — 53% means nothing
