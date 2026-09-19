@@ -254,15 +254,15 @@
                  Sizing is the user's business; an app that names a number is
                  advising on money it knows nothing about. -->
             <div class="rounded-lg bg-emerald-950/40 border border-emerald-900/50 px-3 py-2.5 mb-2">
-              <p class="text-[15px] text-emerald-100">
-                <span class="font-medium" x-text="p.description"></span>
-                at <span class="font-medium" x-text="fmtOdds(p.best_price)"></span>
-                on <span class="font-medium" x-text="p.best_book"></span>
-              </p>
-              <p class="text-[12px] text-emerald-500/80 mt-0.5" x-text="whyText(p)"></p>
+              <p class="text-[16px] text-emerald-50 font-medium" x-text="instruction(p)"></p>
+              <p class="text-[13px] text-emerald-400/90 mt-1" x-text="reason(p)"></p>
             </div>
 
-            <p class="text-[13px] text-slate-400 leading-snug" x-text="p.detail"></p>
+            <!-- `p.detail` is the market-maker sentence: "Fair value 53.0% from
+                 sharp book across 24 books; best available price implies 50.5%.
+                 Cross-book disagreement 1.1%." It is true, it is the homework,
+                 and nobody asked to see the homework. It moves behind the
+                 disclosure with the rest of the evidence. -->
             <button @click="showWhy = (showWhy===p.pick_id ? null : p.pick_id)"
                     class="text-[11px] text-slate-500 mt-1"
                     x-text="showWhy===p.pick_id ? 'hide detail' : 'where does this number come from?'"></button>
@@ -270,6 +270,7 @@
         </div>
 
         <div x-show="showWhy===p.pick_id" class="mt-2 pt-2 border-t border-slate-800">
+          <p class="text-[12px] text-slate-400 leading-snug mb-2" x-text="p.detail"></p>
           <div class="grid grid-cols-2 gap-y-1 text-[11px]">
             <span class="text-slate-500">win probability</span>
             <span class="text-slate-200"
@@ -706,13 +707,23 @@ function algo(){return{
   showWhy:null, rtVerdicts:[], rtHigh:false, day:'all', showGlossary:false,
   // Restored from the last visit: a sort is a preference, and making
   // someone re-pick it on every load is how a control stops being used.
-  // Default is VALUE, not chance. Best-chance ranks by win probability, which
-  // puts -900 favourites at the top — live on 20 September the first card was a
-  // -900 with -0.0% edge. Price discrepancy is the product; win probability is
-  // something the market has already priced. Best chance stays available for
-  // anyone who wants it, it is just not the first thing anyone sees.
-  sort:(()=>{ try{ return localStorage.getItem('algo.sort') || 'edge' }
-              catch(e){ return 'edge' } })(),
+  // The default has been wrong twice, in opposite directions, and both times
+  // the first card on the board was the one a user should trust least:
+  //
+  //   Best chance  → ranked by win probability, so -900 favourites led. Live on
+  //                  20 September the first card was a -900 at -0.0% edge. Win
+  //                  probability is the thing the market has ALREADY priced.
+  //   Biggest edge → ranked by the size of the gap, so thin markets led. Live on
+  //                  18 September the first card was a prop quoted by four books
+  //                  with 3.7% disagreement, above a total twenty-four books
+  //                  agreed on to within 1.1%. Big edges are mostly bad data.
+  //
+  // Neither number is the product on its own. The product is "a price that is
+  // wrong, on a market enough books quote that we can tell". Tier is exactly
+  // that judgement, so the default sorts by tier and lets edge order within it.
+  // Both of the old sorts stay available; they are just not what opens.
+  sort:(()=>{ try{ return localStorage.getItem('algo.sort') || 'best' }
+              catch(e){ return 'best' } })(),
 
   // ---- glossary ---------------------------------------------------------
   // Terms live in one place and are selected per tab. Defining "units" once in
@@ -1062,6 +1073,41 @@ function algo(){return{
 
   fmtOdds(p){return p>0?'+'+p:''+p},
 
+  // THE INSTRUCTION. What to bet, where, at what price — in the order someone
+  // asks it, in words they already use. "Take Over 44.5 at -102 on Lowvig."
+  //
+  // Everything else on this card is evidence for this one sentence, and every
+  // previous version of it led with the evidence instead: "Fair value 53.0%
+  // from sharp book across 24 books..." That sentence exists to prove the
+  // system did its homework. Nobody opens a betting app asking for proof.
+  instruction(p){
+    const book = (p.best_book||'').replace(/_/g,' ')
+                    .replace(/\b\w/g, c => c.toUpperCase());
+    return `Take ${p.description} at ${this.fmtOdds(p.best_price)} on ${book}`;
+  },
+
+  // ONE LINE OF WHY, in the same register. No percentages the reader has to
+  // convert, no vocabulary from the glossary, no hedging.
+  //
+  //   "24 books say this hits 53% of the time. Lowvig is paying even money."
+  //
+  // The hedges are not deleted — tier, book count, dispersion and the market
+  // sentence all live behind "where does this number come from?". They belong
+  // to the one reader in fifty who wants them, not in front of the other 49.
+  reason(p){
+    const books = (()=>{ try{ return JSON.parse(p.prob_components||'{}').book_count || 0 }
+                         catch(e){ return 0 } })();
+    const pct = Math.round(winProb(p)*100);
+    const book = (p.best_book||'').replace(/_/g,' ')
+                    .replace(/\b\w/g, c => c.toUpperCase());
+    const who = books ? `${books} books say` : 'The market says';
+    const price = Number(p.best_price);
+    const pays = price === 100 ? 'is paying even money'
+               : price > 0 ? `is paying +${price}`
+               : `has it at ${price}`;
+    return `${who} this hits ${pct}% of the time. ${book} ${pays}.`;
+  },
+
   // Sort options. Each carries its own direction, because only one direction of
   // each of these is ever a question someone asks — nobody is looking for the
   // least likely bet or the widest market disagreement.
@@ -1074,8 +1120,21 @@ function algo(){return{
     {key:'win',  label:'Best chance',
      hint:'Most likely to win first. These are usually favourites, where the price already reflects it.',
      cmp:(a,b)=> winProb(b) - winProb(a)},
-    {key:'edge', label:'Best value',
-     hint:'Biggest expected profit per $100 first. Often near coin flips — the price is wrong, not the bet safe.',
+    {key:'best', label:'Best bets',
+     hint:'Most evidence first: how many books quote it, how tightly they agree, then the size of the gap.',
+     // TIER, THEN EDGE. Edge size and evidence quality point in OPPOSITE
+     // directions — a 10.7% edge on a prop four books quote is less trustworthy
+     // than 5.0% on a total twenty-four books agree on. Sorting by edge alone
+     // put the thinnest pick on the board at the top, which is exactly the shape
+     // of the data problem we spent the day removing.
+     //
+     // Tier already encodes the evidence: book count, cross-book agreement, and
+     // whether a sharp book is among them. So rank by tier and let edge order
+     // within it.
+     cmp:(a,b)=> String(a.tier||'Z').localeCompare(String(b.tier||'Z'))
+                 || ((b.edge_pct||0) - (a.edge_pct||0))},
+    {key:'edge', label:'Biggest edge',
+     hint:'Largest gap from fair first, regardless of how many books quote it. Big numbers here usually mean thin markets.',
      cmp:(a,b)=> (b.edge_pct||0) - (a.edge_pct||0)},
     {key:'time', label:'Kickoff',
      hint:'Soonest kickoff first.',

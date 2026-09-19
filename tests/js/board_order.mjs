@@ -6,45 +6,55 @@
 // default sort was win probability (which ranks favourites the market has
 // already priced), and nothing pushed dark picks down.
 //
-// Extracted from templates/app.html rather than copied, so a change to the
-// shipped comparators cannot leave this passing against a stale duplicate.
+// This file used to claim, in this comment, that it read the comparators out of
+// templates/app.html — while actually defining its own copy thirty lines below.
+// That copy went stale the moment the shipped sorts changed, and the only thing
+// that noticed was an unrelated regex assertion at the bottom. A test that
+// describes itself as extracting, and doesn't, is worse than an honest copy:
+// it advertises a guarantee nobody is providing.
+//
+// It now genuinely extracts. If the extraction stops matching, that is a hard
+// failure, not a silent skip.
 
-function winProb(p){ return p.blended_prob ?? p.fair_prob ?? 0 }
-const SORTS = [
-    {key:'win',  label:'Best chance',
-     hint:'Most likely to win first. These are usually favourites, where the price already reflects it.',
-     cmp:(a,b)=> winProb(b) - winProb(a)},
-    {key:'edge', label:'Best value',
-     hint:'Biggest expected profit per $100 first. Often near coin flips — the price is wrong, not the bet safe.',
-     cmp:(a,b)=> (b.edge_pct||0) - (a.edge_pct||0)},
-    {key:'time', label:'Kickoff',
-     hint:'Soonest kickoff first.',
-     // A missing kickoff sorts LAST. `||''` would put it first, because the
-     // empty string precedes every timestamp — so the games we know least about
-     // would lead a list whose whole purpose is "what starts next".
-     cmp:(a,b)=> (a.kickoff_utc||'￿').localeCompare(b.kickoff_utc||'￿')},
-    {key:'tier', label:'Tier',
-     hint:'A tier first: most books quoting, closest agreement, a sharp book among them.',
-     cmp:(a,b)=> String(a.tier||'Z').localeCompare(String(b.tier||'Z'))},
-  ]
+import { readFileSync } from "node:fs";
+
+const html = readFileSync(new URL("../../templates/app.html", import.meta.url), "utf8");
+
+const grab = (re, what) => {
+  const m = html.match(re);
+  if (!m) throw new Error(`could not find ${what} in templates/app.html — did it get renamed?`);
+  return m[0];
+};
+
+const winProbSrc = grab(/function winProb\(p\)\{[^}]*\}/s, "winProb()");
+const sortsSrc = grab(/ {2}SORTS: \[.*?\n {2}\],/s, "SORTS")
+  .replace("  SORTS: [", "const SORTS = [")
+  .replace(/,$/, "");
+
+// The shipped method reads `this.SORTS` / `this.sort` and filters by day. Bind
+// it to a stand-in component so the ordering logic under test is the shipped
+// text, character for character, rather than a paraphrase of it.
+const visibleSrc = grab(/ {2}visiblePicks\(\)\{.*?\n {2}\},/s, "visiblePicks()")
+  .replace(/,$/, "");
+
+const { SORTS, winProb, visiblePicks } = await import(
+  "data:text/javascript," + encodeURIComponent(`
+${winProbSrc}
+${sortsSrc}
+const _c = { SORTS, day: 'all', dayKey: () => 'all', ${visibleSrc} };
 const visiblePicks = (list, sortKey) => {
-    
-    const s = SORTS.find(x=>x.key===sortKey) || SORTS[0];
-    // Copy rather than sort in place: `this.picks` is the source of truth for
-    // the day chips and their counts, and mutating it here would reorder them
-    // as a side effect of rendering.
-    //
-    // Every comparator falls back to win probability, so two picks that tie on
-    // the chosen number still land in a stable, meaningful order rather than
-    // whatever order the API happened to return.
-    // Withdrawn picks sink, whatever the sort. Admins see them (users do not),
-    // and a dark pick at the top of the board makes a working system look broken.
-    return [...list].sort((a,b)=>
-      ((a.published ? 0 : 1) - (b.published ? 0 : 1))
-      || s.cmp(a,b) || (winProb(b) - winProb(a)));
-  }
-let f=0; const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w); if(!ok)f++;
-  console.log(`  ${ok?'ok  ':'FAIL'}  ${n}  ${JSON.stringify(g)}`)};
+  _c.picks = list; _c.sort = sortKey;
+  return _c.visiblePicks();
+};
+export { SORTS, winProb, visiblePicks };`)
+);
+
+let f = 0;
+const t = (n, g, w) => {
+  const ok = JSON.stringify(g) === JSON.stringify(w);
+  if (!ok) { f++; console.log(`  FAIL  ${n}\n        got  ${JSON.stringify(g)}\n        want ${JSON.stringify(w)}`); }
+  else console.log(`  ok    ${n}  ${JSON.stringify(g)}`);
+};
 
 const board = [
   {id:"SF_dark",  published:0, blended_prob:0.90, edge_pct:-0.0, tier:"C", kickoff_utc:"2026-09-20T17:00:00Z"},
@@ -52,12 +62,49 @@ const board = [
   {id:"live_mid", published:1, blended_prob:0.55, edge_pct: 3.1, tier:"C", kickoff_utc:"2026-09-20T17:00:00Z"},
   {id:"live_best",published:1, blended_prob:0.41, edge_pct: 7.4, tier:"A", kickoff_utc:"2026-09-20T20:00:00Z"},
 ];
-t("live picks lead, dark sinks (best value)",
+
+t("live picks lead, dark sinks (biggest edge)",
   visiblePicks(board,"edge").map(p=>p.id), ["live_best","live_mid","SF_dark","TB_dark"]);
 t("dark sinks on best chance too",
   visiblePicks(board,"win").map(p=>p.id), ["live_mid","live_best","SF_dark","TB_dark"]);
 t("and on kickoff",
   visiblePicks(board,"time").map(p=>p.id).slice(0,2), ["live_mid","live_best"]);
-t("default sort key is edge", /localStorage.getItem\('algo.sort'\) \|\| 'edge'/.test(
-  (await import('node:fs')).readFileSync('templates/app.html','utf8')), true);
-console.log(f?`\n${f} FAILED`:"\nall passed"); process.exit(f?1:0);
+t("and on the default",
+  visiblePicks(board,"best").map(p=>p.id), ["live_best","live_mid","TB_dark","SF_dark"]);
+
+// ---------------------------------------------------------------------------
+// The default must lead with the best-EVIDENCED pick, not the biggest number.
+//
+// On 18 September the board's default (raw edge) opened on Chris Godwin o47.5:
+// 10.7% edge, tier C, four books, 3.7% cross-book disagreement — the thinnest
+// support on the board. The A-tier Over 44.5, quoted by twenty-four books
+// agreeing to within 1.1%, sat second at 5.0%.
+//
+// That is not a near-miss. Edge size and evidence quality are inversely related
+// here: thin markets manufacture big edges, which is the entire reason
+// MAX_PLAUSIBLE_EDGE_PCT exists. Sorting by edge alone reliably promotes
+// whatever the guards did not quite catch.
+// ---------------------------------------------------------------------------
+const LIVE_18_SEP = [
+  {id:"godwin",  published:1, tier:"C", edge_pct:10.7, blended_prob:0.52, kickoff_utc:"2026-09-18T20:00:00Z"},
+  {id:"over445", published:1, tier:"A", edge_pct: 5.0, blended_prob:0.51, kickoff_utc:"2026-09-18T20:00:00Z"},
+  {id:"chi3",    published:1, tier:"B", edge_pct: 5.0, blended_prob:0.53, kickoff_utc:"2026-09-18T20:00:00Z"},
+];
+t("the default leads with A tier, not the fattest edge",
+  visiblePicks(LIVE_18_SEP,"best").map(p=>p.id), ["over445","chi3","godwin"]);
+t("edge still orders WITHIN a tier",
+  visiblePicks([...LIVE_18_SEP,
+    {id:"chi_fat", published:1, tier:"B", edge_pct:8.0, blended_prob:0.50,
+     kickoff_utc:"2026-09-18T20:00:00Z"}], "best").map(p=>p.id),
+  ["over445","chi_fat","chi3","godwin"]);
+
+// The control. Without it, a default that simply ignored edge would pass above.
+t("'Biggest edge' is still available and still sorts by edge",
+  visiblePicks(LIVE_18_SEP,"edge").map(p=>p.id)[0], "godwin");
+
+const src = readFileSync(new URL("../../templates/app.html", import.meta.url), "utf8");
+t("default sort key is 'best'",
+  /localStorage\.getItem\('algo\.sort'\) \|\| 'best'/.test(src), true);
+
+console.log(f ? `\n${f} FAILED` : "\nall passed");
+process.exit(f ? 1 : 0);

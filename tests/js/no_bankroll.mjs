@@ -44,7 +44,17 @@ t("no 'biggest stake' sort",             /Biggest stake/.test(stripped), false);
 t("stake field is not prefilled",        /stake:''/.test(html), true);
 
 console.log("\nstill intact:");
-t("4 sorts remain", (html.match(/SORTS: \[[\s\S]*?\n  \],/)[0].match(/key:'/g)||[]).length, 4);
+// This asserted a count of 4, which is not the rule — it is a proxy that
+// happened to coincide with the rule on the day it was written. Adding a
+// legitimate 'best bets' sort broke it while breaking nothing it exists to
+// protect. Assert the actual property: sorts exist, and none of them ranks by
+// anything resembling a stake.
+const sortsBlock = html.match(/SORTS: \[[\s\S]*?\n  \],/)[0];
+t("sorts still exist", (sortsBlock.match(/key:'/g)||[]).length >= 3, true);
+t("no sort ranks by stake/roll/units/bankroll",
+  /key:'(stake|units|roll|bankroll|kelly)'/i.test(sortsBlock), false);
+t("no sort is LABELLED with a stake concept",
+  /(label|hint):'[^']*(stake|bankroll|of roll|kelly|unit)/i.test(sortsBlock), false);
 t("why line still shows book count", whyText(CIN), "25 books say 67.4% · this price is 2.9% better than fair");
 t("edge still on the card", /p\.edge_pct\.toFixed\(1\)\+'% edge'/.test(html), true);
 console.log(failed?`\n${failed} FAILED`:"\nall passed");

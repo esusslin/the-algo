@@ -74,7 +74,15 @@ t("chance and value are genuinely different orders",
   JSON.stringify(by("win")) !== JSON.stringify(by("edge")), true);
 
 t("every sort explains itself", SORTS.every((s) => s.hint && s.hint.length > 10), true);
-t("the default sort exists", SORTS.some((s) => s.key === "win"), true);
+t("the default sort exists", SORTS.some((s) => s.key === "best"), true);
+
+// The default must rank by EVIDENCE, not by edge size. Live on 20 September,
+// sorting by edge alone put a 10.7% prop quoted by four books above a 5.0% total
+// quoted by twenty-four — the thinnest pick on the board, first.
+t("best bets puts tier A above a fatter tier C edge",
+  [...PICKS, { id: "FAT_C", blended_prob: 0.50, edge_pct: 10.7, tier: "C",
+               kickoff_utc: "2026-09-13T17:00:00+00:00" }]
+    .sort((a, b) => SORTS.find(s => s.key === "best").cmp(a, b))[0].tier, "A");
 
 console.log(failed ? `\n${failed} failed` : `\n${SORTS.length} sorts, all passed`);
 process.exit(failed ? 1 : 0);

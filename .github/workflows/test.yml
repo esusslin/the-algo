@@ -42,6 +42,9 @@ jobs:
       - name: Board ordering (JS)
         run: node tests/js/board_order.mjs
 
+      - name: Card copy (JS)
+        run: node tests/js/card_copy.mjs
+
       # Railway deploys on push regardless of CI, so this is a signal rather
       # than a gate. If you want it to block, enable "Wait for CI" in the
       # Railway service settings.
