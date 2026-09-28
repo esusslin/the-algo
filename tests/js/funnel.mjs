@@ -39,7 +39,7 @@ const t = (n, g, w) => {
 };
 
 const F = (over = {}) => ({
-  enabled: true, min_edge_pct: 5.0, tier_min_books: { A: 8, B: 6, C: 4 },
+  enabled: true, upcoming_games: 1, min_edge_pct: 5.0, tier_min_books: { A: 8, B: 6, C: 4 },
   collection: { rows: 20573 }, pairing: { paired: 6936 },
   pricing: { rows: 6936 },
   opportunities: { total: 56, best_books: 7, median_books: 5,
@@ -117,6 +117,22 @@ const F = (over = {}) => ({
   const { stages } = make(F({ picks: { live: 3, withdrawn: 0 } }));
   t("no parenthetical when nothing is withdrawn",
     stages.find(s => s.label === "Live prop picks").value, "3");
+}
+
+// --- every stage must describe the same set of games ---------------------
+{
+  // The first version counted the season for collection/pairing/pricing and
+  // only upcoming games for the edge stages, so 24,716 -> 102 looked like a
+  // filter eating 99.6% of props and was actually the subject changing.
+  const { stages } = make(F());
+  t("the scope is stated before any count", stages[1].label, "Upcoming games");
+  t("and carries the game count", stages[1].value, "1");
+}
+{
+  const { stages, verdict } = make(F({ upcoming_games: 0 }));
+  t("no upcoming games is the first thing reported",
+    stages.find(s => s.dead).label, "Upcoming games");
+  t("and is flagged rather than blamed on props", verdict.bad, true);
 }
 
 console.log(f ? `\n${f} FAILED` : "\nall passed");

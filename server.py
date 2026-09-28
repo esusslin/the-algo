@@ -936,10 +936,22 @@ def props_funnel(admin: dict = Depends(auth.current_admin)) -> dict:
         except Exception:  # noqa: BLE001
             return False
 
+    # EVERY stage below is scoped to games that have not kicked off.
+    #
+    # The first version counted the whole season for collection/pairing/pricing
+    # and only upcoming games for the edge stages. That is not a funnel, it is
+    # two different questions stacked to look like one: the 24,716 -> 102 drop
+    # read as a filter destroying 99.6% of props and was actually the subject
+    # changing underneath the reader. Same shape as the /api/edges bug it
+    # replaced — a diagnostic whose structure implies something untrue.
+    UPCOMING = ("(SELECT game_id FROM games WHERE kickoff_utc IS NULL "
+                "OR datetime(kickoff_utc) > datetime('now'))")
+
     # 1. collection
     raw = [dict(r) for r in query(
-        "SELECT market_type, COUNT(*) n, COUNT(DISTINCT book) books, "
-        "MAX(fetched_at) latest FROM odds_current GROUP BY market_type")
+        f"SELECT market_type, COUNT(*) n, COUNT(DISTINCT book) books, "
+        f"MAX(fetched_at) latest FROM odds_current "
+        f"WHERE game_id IN {UPCOMING} GROUP BY market_type")
         if _is_prop(r["market_type"])]
 
     # 2. pairing — a book quoting one side only cannot be devigged, and is
@@ -950,7 +962,8 @@ def props_funnel(admin: dict = Depends(auth.current_admin)) -> dict:
         marks = ",".join("?" * len(raw))
         groups: dict[tuple, set] = {}
         for r in query(f"SELECT game_id, market_type, player_id, side, line, book "
-                       f"FROM odds_current WHERE market_type IN ({marks})",
+                       f"FROM odds_current WHERE market_type IN ({marks}) "
+                       f"AND game_id IN {UPCOMING}",
                        tuple(x["market_type"] for x in raw)):
             groups.setdefault((r["game_id"], r["market_type"], r["player_id"],
                                r["line"], r["book"]), set()).add(r["side"])
@@ -962,8 +975,9 @@ def props_funnel(admin: dict = Depends(auth.current_admin)) -> dict:
 
     # 3. pricing
     priced = [dict(r) for r in query(
-        "SELECT market_type, COUNT(*) n, AVG(book_count) books, AVG(dispersion) disp "
-        "FROM fair_prices GROUP BY market_type") if _is_prop(r["market_type"])]
+        f"SELECT market_type, COUNT(*) n, AVG(book_count) books, AVG(dispersion) disp "
+        f"FROM fair_prices WHERE game_id IN {UPCOMING} "
+        f"GROUP BY market_type") if _is_prop(r["market_type"])]
 
     # 4. thresholds — the cumulative curve, which is what tells you whether the
     #    floor is the problem or the data is.
@@ -982,7 +996,14 @@ def props_funnel(admin: dict = Depends(auth.current_admin)) -> dict:
     prop_picks = [r for r in live if _is_prop(r["market_type"])]
 
     tiers = {t: thresholds_for("player_reception_yds", t) for t in ("A", "B", "C")}
+    # How many games these numbers cover, so "102 markets" can be read as
+    # "102 across one game" rather than an unqualified count.
+    games = query(
+        "SELECT COUNT(*) n FROM games WHERE kickoff_utc IS NULL "
+        "OR datetime(kickoff_utc) > datetime('now')")[0]["n"]
+
     return {
+        "upcoming_games": games,
         "enabled": settings.ENABLE_PROPS,
         "min_edge_pct": settings.MIN_EDGE_PCT,
         "prefilter_min_books": loosest_min_books(),

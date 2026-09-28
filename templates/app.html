@@ -592,6 +592,9 @@
           <span>Props funnel</span>
           <span x-text="showFunnel ? '−' : '+'"></span>
         </button>
+        <p x-show="showFunnel" class="text-slate-600 text-xs mt-2"
+           x-text="funnel.upcoming_games !== undefined
+             ? `Counting only games that have not kicked off.` : ''"></p>
         <div x-show="showFunnel" class="mt-2 space-y-1 text-xs">
           <template x-if="!funnel.collection">
             <p class="text-slate-600">Loading…</p>
@@ -1070,6 +1073,11 @@ function algo(){return{
     const f=this.funnel, o=f.opportunities||{}, p=f.picks||{};
     const raw=[
       {label:'Enabled',            value:f.enabled?'yes':'NO',  zero:!f.enabled},
+      // Stated first, because every number under it is scoped to these games.
+      // Without it "102 markets" is unreadable — across one game that is the
+      // whole board, across twelve it would be a catastrophe.
+      {label:'Upcoming games',
+       value:String(f.upcoming_games ?? '—'), zero:!f.upcoming_games},
       {label:'Prop quotes stored', value:(f.collection?.rows||0).toLocaleString(),
        zero:!(f.collection?.rows)},
       {label:'Two-sided (priceable)', value:(f.pairing?.paired||0).toLocaleString(),
