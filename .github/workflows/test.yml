@@ -45,6 +45,12 @@ jobs:
       - name: Card copy (JS)
         run: node tests/js/card_copy.mjs
 
+      # The funnel readout's whole job is to not mislead you about why props
+      # are missing. Its failure mode is being confidently wrong, which is the
+      # failure it was built to replace.
+      - name: Props funnel readout (JS)
+        run: node tests/js/funnel.mjs
+
       # Railway deploys on push regardless of CI, so this is a signal rather
       # than a gate. If you want it to block, enable "Wait for CI" in the
       # Railway service settings.

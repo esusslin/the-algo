@@ -913,6 +913,98 @@ def _props_refresh_worker() -> None:
         log.info("props refresh: %s", ctx["note"])
 
 
+@app.get("/api/admin/props-funnel")
+def props_funnel(admin: dict = Depends(auth.current_admin)) -> dict:
+    """Where props die, as counts, in the admin panel.
+
+    This logic already existed in `scripts/diagnose_props.py`, which is the
+    right tool and lives in the wrong place: reaching it means `railway link`,
+    an interactive workspace picker, and an SSH session, at the exact moment
+    you want an answer in five seconds. A diagnostic you cannot reach when you
+    need it is not much better than one that lies to you, and tonight produced
+    both.
+
+    Same stages, same order. The first one that goes to zero is the answer and
+    everything after it is noise.
+    """
+    from src.markets import describe_market
+    from src.picks.generator import loosest_min_books, thresholds_for
+
+    def _is_prop(mt: str) -> bool:
+        try:
+            return describe_market(mt).bet_class == "prop"
+        except Exception:  # noqa: BLE001
+            return False
+
+    # 1. collection
+    raw = [dict(r) for r in query(
+        "SELECT market_type, COUNT(*) n, COUNT(DISTINCT book) books, "
+        "MAX(fetched_at) latest FROM odds_current GROUP BY market_type")
+        if _is_prop(r["market_type"])]
+
+    # 2. pairing — a book quoting one side only cannot be devigged, and is
+    #    dropped with no error. Historically the stage most likely to be
+    #    silently eating everything (anytime TD is posted yes-only).
+    paired = unpaired = 0
+    if raw:
+        marks = ",".join("?" * len(raw))
+        groups: dict[tuple, set] = {}
+        for r in query(f"SELECT game_id, market_type, player_id, side, line, book "
+                       f"FROM odds_current WHERE market_type IN ({marks})",
+                       tuple(x["market_type"] for x in raw)):
+            groups.setdefault((r["game_id"], r["market_type"], r["player_id"],
+                               r["line"], r["book"]), set()).add(r["side"])
+        for sides in groups.values():
+            two = any(a in sides and b in sides
+                      for a, b in (("over", "under"), ("yes", "no"), ("home", "away")))
+            paired += two
+            unpaired += not two
+
+    # 3. pricing
+    priced = [dict(r) for r in query(
+        "SELECT market_type, COUNT(*) n, AVG(book_count) books, AVG(dispersion) disp "
+        "FROM fair_prices GROUP BY market_type") if _is_prop(r["market_type"])]
+
+    # 4. thresholds — the cumulative curve, which is what tells you whether the
+    #    floor is the problem or the data is.
+    from src.market.shop import find_opportunities
+    loose = [o for o in find_opportunities(min_edge=-100.0, min_books=1)
+             if _is_prop(o["market_type"])]
+    curve = [{"edge": c, "n": sum(1 for o in loose if o["edge_pct"] >= c)}
+             for c in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0)]
+    books = sorted((o["book_count"] for o in loose), reverse=True)
+
+    # 5. what actually reached the board
+    live = query(
+        "SELECT p.market_type, p.tier, p.published FROM picks p "
+        "LEFT JOIN games g ON g.game_id = p.game_id WHERE p.result='pending' "
+        "AND (g.kickoff_utc IS NULL OR datetime(g.kickoff_utc) > datetime('now'))")
+    prop_picks = [r for r in live if _is_prop(r["market_type"])]
+
+    tiers = {t: thresholds_for("player_reception_yds", t) for t in ("A", "B", "C")}
+    return {
+        "enabled": settings.ENABLE_PROPS,
+        "min_edge_pct": settings.MIN_EDGE_PCT,
+        "prefilter_min_books": loosest_min_books(),
+        "collection": {"markets": len(raw), "rows": sum(r["n"] for r in raw),
+                       "latest": max((r["latest"] for r in raw), default=None),
+                       "by_market": sorted(raw, key=lambda r: -r["n"])[:12]},
+        "pairing": {"paired": paired, "one_sided": unpaired},
+        "pricing": {"markets": len(priced), "rows": sum(r["n"] for r in priced)},
+        "opportunities": {"total": len(loose), "curve": curve,
+                          "best_books": books[0] if books else 0,
+                          "median_books": books[len(books) // 2] if books else 0},
+        "picks": {"live": sum(1 for r in prop_picks if r["published"]),
+                  "withdrawn": sum(1 for r in prop_picks if not r["published"])},
+        # The effective floor is max(global, tier) — if MIN_EDGE_PCT is 5.0 and
+        # prop tier C asks 3.2, the 3.2 is decorative and nothing between the
+        # two ever reaches tiering. That is a config answer, not a bug.
+        "effective_min_edge": {
+            t: max(v["min_edge"], settings.MIN_EDGE_PCT) for t, v in tiers.items()},
+        "tier_min_books": {t: v["min_books"] for t, v in tiers.items()},
+    }
+
+
 @app.get("/api/admin/props-refresh")
 def props_refresh_estimate(admin: dict = Depends(auth.current_admin)) -> dict:
     """What pressing the button would cost, before pressing it."""

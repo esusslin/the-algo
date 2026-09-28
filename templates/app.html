@@ -581,6 +581,39 @@
 
       <p class="text-xs text-slate-400 mt-3" x-text="busy||ingestMsg"></p>
 
+      <!-- Where props die, in order. This lived only in a script you had to
+           reach through `railway link`, an interactive workspace picker and an
+           SSH session — which is to say, not reachable at the moment you want
+           it. The first stage showing zero is the answer; everything below it
+           is noise. -->
+      <div class="mt-3 pt-3 border-t border-slate-800">
+        <button @click="showFunnel = !showFunnel; if(showFunnel) loadFunnel()"
+                class="w-full text-left text-xs text-slate-400 flex justify-between">
+          <span>Props funnel</span>
+          <span x-text="showFunnel ? '−' : '+'"></span>
+        </button>
+        <div x-show="showFunnel" class="mt-2 space-y-1 text-xs">
+          <template x-if="!funnel.collection">
+            <p class="text-slate-600">Loading…</p>
+          </template>
+          <template x-if="funnel.collection">
+            <div class="space-y-1">
+              <template x-for="st in funnelStages()" :key="st.label">
+                <div class="flex justify-between">
+                  <span :class="st.dead ? 'text-red-400' : 'text-slate-500'"
+                        x-text="st.label"></span>
+                  <span :class="st.dead ? 'text-red-400' : 'text-slate-200'"
+                        x-text="st.value"></span>
+                </div>
+              </template>
+              <p class="pt-2 mt-1 border-t border-slate-800"
+                 :class="funnelVerdict().bad ? 'text-amber-400' : 'text-slate-500'"
+                 x-text="funnelVerdict().text"></p>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <div class="grid grid-cols-2 gap-y-1 text-xs mt-3 pt-3 border-t border-slate-800">
         <template x-for="(v,k) in (status.counts||{})" :key="k">
           <template x-if="true">
@@ -1022,7 +1055,54 @@ function algo(){return{
   async loadStatus(){
     this.status=await(await fetch('/api/admin/ingest-status',{headers:this.hdr()})).json();
   },
-  propsEst:{},
+  propsEst:{}, funnel:{}, showFunnel:false,
+  async loadFunnel(){
+    try{
+      const r=await fetch('/api/admin/props-funnel',{headers:this.hdr()});
+      this.funnel = r.ok ? await r.json() : {};
+    }catch(e){ this.funnel={} }
+  },
+  // Ordered deliberately: this is a chain, and reading it top to bottom is the
+  // whole method. `dead` marks the FIRST stage that zeroed — only the first,
+  // because everything after a zero is necessarily zero too and colouring them
+  // all red says the system is five kinds of broken when it is one kind.
+  funnelStages(){
+    const f=this.funnel, o=f.opportunities||{}, p=f.picks||{};
+    const raw=[
+      {label:'Enabled',            value:f.enabled?'yes':'NO',  zero:!f.enabled},
+      {label:'Prop quotes stored', value:(f.collection?.rows||0).toLocaleString(),
+       zero:!(f.collection?.rows)},
+      {label:'Two-sided (priceable)', value:(f.pairing?.paired||0).toLocaleString(),
+       zero:!(f.pairing?.paired)},
+      {label:'Priced (fair value)', value:(f.pricing?.rows||0).toLocaleString(),
+       zero:!(f.pricing?.rows)},
+      {label:'With any edge',      value:(o.total||0).toLocaleString(), zero:!o.total},
+      {label:`Clearing ${f.min_edge_pct}% floor`,
+       value:String((o.curve||[]).find(c=>c.edge===f.min_edge_pct)?.n ?? '—'),
+       zero:!((o.curve||[]).find(c=>c.edge===f.min_edge_pct)?.n)},
+      {label:'Live prop picks',    value:String(p.live ?? 0), zero:!p.live},
+    ];
+    const first = raw.findIndex(r=>r.zero);
+    return raw.map((r,i)=>({...r, dead: i===first}));
+  },
+  funnelVerdict(){
+    const f=this.funnel, o=f.opportunities||{};
+    const st=this.funnelStages(), dead=st.find(s=>s.dead);
+    if(!dead) return {bad:false, text:'Every stage populated.'};
+    // The common and least alarming case, and worth saying out loud so it is
+    // not mistaken for a pipeline failure: props exist and are priced, the edge
+    // floor is simply higher than anything on offer tonight.
+    //
+    // BOTH of the last two stages mean this. With 56 priced opportunities and
+    // none over 5%, the first zero is 'Clearing the floor', not 'Live prop
+    // picks' — checking only the latter reported a healthy quiet slate as
+    // broken, which is the precise mistake this readout replaces.
+    const benign = ['Clearing', 'Live prop picks'];
+    if(o.total && benign.some(b => dead.label.startsWith(b)))
+      return {bad:false, text:`Props are flowing — nothing clears the ${f.min_edge_pct}% floor right now. `
+        + `Best book coverage ${o.best_books}, median ${o.median_books} (tier C needs ${f.tier_min_books?.C}).`};
+    return {bad:true, text:`First stage at zero: ${dead.label}. Everything below it is a consequence, not a cause.`};
+  },
   // Estimate before spend. Fetched when the admin tab opens and again after any
   // refresh, so the number on the button is the number you are about to pay.
   async loadPropsEstimate(){
