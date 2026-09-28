@@ -88,7 +88,8 @@ def find_opportunities(min_edge: float | None = None,
                        use_sharp_anchor: bool = True,
                        min_books: int = 8,
                        main_line_only: bool = True,
-                       bettable_only: bool = True) -> list[dict]:
+                       bettable_only: bool = True,
+                       upcoming_only: bool = True) -> list[dict]:
     """Every market where the best available price beats fair value.
 
     `use_sharp_anchor=True` prices against Pinnacle where available, falling
@@ -100,18 +101,52 @@ def find_opportunities(min_edge: float | None = None,
     fake edges — see main_lines(). `bettable_only` filters to books you can
     actually get down at; an edge at an offshore book you have no account with
     is not an edge.
+
+    `upcoming_only` excludes games that have already kicked off. **Nothing
+    deletes rows from `odds_current` or `fair_prices`**, so every price from
+    every game since week 1 is still sitting there, frozen at whatever was last
+    polled before kickoff. Books stop quoting a game once it starts; the last
+    quote is often a wide, stale, one-sided number nobody was ever going to
+    fill.
+
+    Live on 28 September 2026, week 4: of 87 opportunities returned, most were
+    for games played in weeks 1 to 3, and the single largest "edge" on the board
+    — 22.6%, 13 books — was a Baltimore-Dallas spread from three weeks earlier.
+    It cleared every guard: enough books, tight enough dispersion, and just
+    under MAX_PLAUSIBLE_EDGE_PCT. The arithmetic was correct. The game was over.
+
+    This is the same failure as the implausible-edge bug, one layer up: the
+    pipeline working perfectly on data it should have distrusted. The guards
+    there ask "is this number believable?". This one asks the question that
+    should come first — "is this bet still available?".
     """
     min_edge = settings.MIN_EDGE_PCT if min_edge is None else min_edge
     best = best_prices(game_id)
     mains = main_lines(game_id) if main_line_only else None
     bettable = set(settings.BETTABLE_BOOKS) if bettable_only else None
 
-    sql = ("SELECT game_id, market_type, player_id, side, line, fair_prob, "
-           "sharp_prob, book_count, dispersion FROM fair_prices")
+    # LEFT JOIN, not INNER: a fair price whose game row is missing should still
+    # be evaluated rather than silently vanish, matching `current_slate`.
+    # Absence of a kickoff is not evidence of kickoff — and making the opposite
+    # choice would empty the board entirely any week the games table lagged.
+    #
+    # `datetime()` on both sides, not string comparison: kickoffs are stored
+    # offset-aware (`...+00:00`) and `datetime('now')` is not, so a raw `>`
+    # compares the offset suffix as text and is quietly wrong.
+    sql = ("SELECT f.game_id, f.market_type, f.player_id, f.side, f.line, "
+           "f.fair_prob, f.sharp_prob, f.book_count, f.dispersion "
+           "FROM fair_prices f "
+           "LEFT JOIN games g ON g.game_id = f.game_id")
+    where: list[str] = []
     params: list = []
     if game_id:
-        sql += " WHERE game_id=?"
-        params = [game_id]
+        where.append("f.game_id=?")
+        params.append(game_id)
+    if upcoming_only:
+        where.append("(g.kickoff_utc IS NULL "
+                     "OR datetime(g.kickoff_utc) > datetime('now'))")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
 
     out: list[dict] = []
     implausible: list[tuple] = []

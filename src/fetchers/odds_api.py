@@ -170,8 +170,34 @@ class CreditLedger:
         )
         return int(row[0]["n"]) if row else 0
 
+    def manual_used_this_month(self) -> int:
+        """Manual credits spent since the plan reset.
+
+        Same window as `used_this_month`: The Odds API resets monthly plans on
+        the 1st at 00:00 UTC, so the sub-budget has to be measured on that
+        boundary and not a rolling 30 days, or the cap drifts out of phase with
+        the allowance it is protecting.
+        """
+        first = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        row = query(
+            "SELECT COALESCE(SUM(credits_used),0) AS n FROM odds_credit_ledger "
+            "WHERE source='manual' AND called_at >= ?", (first,)
+        )
+        return int(row[0]["n"]) if row else 0
+
     def manual_remaining_today(self) -> int:
-        return max(0, settings.ODDS_MANUAL_DAILY_CREDITS - self.manual_used_today())
+        """Whichever ceiling binds first.
+
+        The daily cap stops a runaway; the monthly cap stops a habit. Returning
+        the minimum means the caller does not have to know which one is biting,
+        and the button cannot be affordable by one measure while overdrawn on
+        the other.
+        """
+        daily = settings.ODDS_MANUAL_DAILY_CREDITS - self.manual_used_today()
+        monthly = settings.ODDS_MANUAL_MONTHLY_CREDITS - self.manual_used_this_month()
+        return max(0, min(daily, monthly))
 
     def allows(self, tier_name: str) -> bool:
         pct = self.remaining_pct()

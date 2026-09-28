@@ -1044,9 +1044,16 @@ function algo(){return{
     const e=this.propsEst;
     if(e.games===0) return 'No games left to kick off today.';
     if(!e.credits) return '';
-    if(e.credits>e.manual_remaining_today)
-      return `Daily manual allowance spent (${e.manual_used_today} used). Resets 00:00 UTC.`;
-    const left=`${e.manual_remaining_today} of today's manual allowance left`;
+    if(e.credits>e.manual_remaining_today){
+      // Two caps, so say which one is biting — otherwise the fix is a guess
+      // between two environment variables.
+      const dayLeft=(e.manual_daily_cap||0)-(e.manual_used_today||0);
+      const monLeft=(e.manual_monthly_cap||0)-(e.manual_used_this_month||0);
+      return dayLeft<=monLeft
+        ? `Daily allowance spent (${e.manual_used_today}/${e.manual_daily_cap}). Resets 00:00 UTC.`
+        : `Monthly allowance spent (${e.manual_used_this_month}/${e.manual_monthly_cap}). Resets on the 1st.`;
+    }
+    const left=`${e.manual_remaining_today} left of today's manual allowance`;
     // Say WHY the button matters right now. If props are being shed, the
     // scheduler is not polling them at all and this is the only way to get them.
     return e.would_be_shed

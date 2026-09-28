@@ -106,13 +106,28 @@ class Settings:
 
     # ---- budgets ----
     ODDS_MONTHLY_CREDIT_BUDGET: int = _int("ODDS_MONTHLY_CREDIT_BUDGET", 100_000)
-    # Ceiling on what the admin "refresh" button may spend per UTC day. A full
-    # 16-game props sweep is 9 markets x 1 region x 16 = 144 credits, so 500
-    # buys three full slates a day. The cap exists because the button
-    # deliberately overrides the monthly shed: without it, a stuck finger or a
-    # retry loop could spend the month in an afternoon, and the shed -- the
-    # thing that normally stops exactly that -- is the guard being bypassed.
-    ODDS_MANUAL_DAILY_CREDITS: int = _int("ODDS_MANUAL_DAILY_CREDITS", 500)
+    # Ceilings on what the admin "refresh" button may spend. A full 16-game
+    # props sweep is 9 markets x 1 region x 16 = 144 credits.
+    #
+    # TWO caps, because they stop different things.
+    #
+    # The DAILY cap bounds a runaway: a stuck finger, a retry loop, a tab left
+    # refreshing. It is deliberately loose enough to be invisible in normal use
+    # -- ten full slates -- because a cap you hit while working normally just
+    # teaches you to raise it.
+    #
+    # The MONTHLY cap is the one that protects anything. Measured 28 September
+    # 2026: the scheduler burns ~1,870 credits/day, ~56,000 of the 100,000
+    # plan, leaving ~44,000 spare. A daily cap alone does not bound monthly
+    # spend at all -- 1,500/day is 45,000/month if something presses every day,
+    # which would eat the entire margin and start starving the SCHEDULED polls
+    # that feed moneyline, spread and totals.
+    #
+    # That is the real failure mode, and it is not a bill. Credits are prepaid:
+    # at $59 for 100,000 a manual sweep costs about six cents. Exhausting them
+    # returns 429 and the data simply stops, for every market, until the 1st.
+    ODDS_MANUAL_DAILY_CREDITS: int = _int("ODDS_MANUAL_DAILY_CREDITS", 1_500)
+    ODDS_MANUAL_MONTHLY_CREDITS: int = _int("ODDS_MANUAL_MONTHLY_CREDITS", 15_000)
     AI_MONTHLY_BUDGET_USD: float = _float("AI_MONTHLY_BUDGET_USD", 150.0)
 
     # ---- feature flags (staged rollout — see implementation arch doc §8) ----

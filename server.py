@@ -922,7 +922,10 @@ def props_refresh_estimate(admin: dict = Depends(auth.current_admin)) -> dict:
     ledger = CreditLedger()
     return {**est,
             "manual_used_today": ledger.manual_used_today(),
+            "manual_used_this_month": ledger.manual_used_this_month(),
             "manual_remaining_today": ledger.manual_remaining_today(),
+            "manual_daily_cap": settings.ODDS_MANUAL_DAILY_CREDITS,
+            "manual_monthly_cap": settings.ODDS_MANUAL_MONTHLY_CREDITS,
             "monthly_remaining_pct": round(ledger.remaining_pct(), 1),
             "would_be_shed": not ledger.allows("props")}
 
@@ -949,11 +952,22 @@ def props_refresh(admin: dict = Depends(auth.current_admin)) -> dict:
     if est["games"] == 0:
         raise HTTPException(409, "no games left to kick off today — nothing to poll")
     if est["credits"] > remaining:
+        # Name WHICH ceiling bit. "You have 0 left" with two caps in play is
+        # a message that sends you to the wrong environment variable.
+        daily_left = settings.ODDS_MANUAL_DAILY_CREDITS - ledger.manual_used_today()
+        monthly_left = (settings.ODDS_MANUAL_MONTHLY_CREDITS
+                        - ledger.manual_used_this_month())
+        which = ("today's" if daily_left <= monthly_left else "this month's")
+        resets = ("00:00 UTC" if daily_left <= monthly_left
+                  else "the 1st at 00:00 UTC")
         raise HTTPException(
             429,
             f"manual refresh would cost {est['credits']} credits but only "
-            f"{remaining} of today's {settings.ODDS_MANUAL_DAILY_CREDITS} "
-            f"manual allowance is left. Resets at 00:00 UTC.")
+            f"{remaining} of {which} manual allowance is left "
+            f"(day {ledger.manual_used_today()}/"
+            f"{settings.ODDS_MANUAL_DAILY_CREDITS}, "
+            f"month {ledger.manual_used_this_month()}/"
+            f"{settings.ODDS_MANUAL_MONTHLY_CREDITS}). Resets {resets}.")
 
     scheduler.add_job(
         _props_refresh_worker, "date",
@@ -1005,8 +1019,15 @@ def list_users(admin: dict = Depends(auth.current_admin)) -> dict:
 
 
 @app.get("/api/edges")
-def edges(min_edge: float = 2.0) -> dict:
-    """Raw opportunity list before tiering — the admin/debug view."""
+def edges(min_edge: float = 2.0,
+          admin: dict = Depends(auth.current_admin)) -> dict:
+    """Raw opportunity list before tiering — the admin/debug view.
+
+    Gated 28 September 2026. It shipped unauthenticated, and because it sits
+    outside the `/api/admin` prefix the route audit that caught
+    `POST /api/admin/run/{job_id}` did not cover it. It serves the entire
+    pre-tier opportunity list — which is the product — to anyone with the URL.
+    """
     from src.market.shop import find_opportunities
     opps = find_opportunities(min_edge=min_edge)
     return {"count": len(opps), "min_edge": min_edge, "edges": opps[:100]}
