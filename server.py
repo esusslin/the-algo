@@ -1029,8 +1029,31 @@ def edges(min_edge: float = 2.0,
     pre-tier opportunity list — which is the product — to anyone with the URL.
     """
     from src.market.shop import find_opportunities
-    opps = find_opportunities(min_edge=min_edge)
-    return {"count": len(opps), "min_edge": min_edge, "edges": opps[:100]}
+    from src.picks.generator import loosest_min_books
+
+    # MUST match what generate() passes, or this lies about the thing it
+    # exists to explain.
+    #
+    # It did. `find_opportunities` defaults to min_books=8, a game-market
+    # number; props cap around 7 books, live median 5. That default is the
+    # exact bug fixed in generate() on 13 September -- a class-blind book
+    # floor that discarded every prop before tiering -- and it survived here,
+    # unfixed, in the endpoint you reach for when props are missing.
+    #
+    # On 28 September this endpoint returned 87 opportunities and not one prop,
+    # which reads as "props are broken" and is actually "this endpoint cannot
+    # show props". A diagnostic that confidently reports the absence of what it
+    # structurally cannot see is worse than no diagnostic: it sends you
+    # somewhere else entirely.
+    min_books = loosest_min_books()
+    opps = find_opportunities(min_edge=min_edge, min_books=min_books)
+    by_class: dict[str, int] = {}
+    for o in opps:
+        from src.markets import describe_market
+        by_class[describe_market(o["market_type"]).bet_class] = \
+            by_class.get(describe_market(o["market_type"]).bet_class, 0) + 1
+    return {"count": len(opps), "min_edge": min_edge, "min_books": min_books,
+            "by_class": by_class, "edges": opps[:100]}
 
 
 @app.post("/api/admin/run/{job_id}")

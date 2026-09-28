@@ -321,3 +321,196 @@ def test_the_routes_that_spend_money_or_change_state_require_ADMIN() -> None:
         deps = getattr(getattr(route, "dependant", None), "dependencies", [])
         names = {getattr(d.call, "__name__", "") for d in deps}
         assert "current_admin" in names, f"{route.path} is not admin-gated"
+
+
+# ---------------------------------------------------------------------------
+# "today" means today where the games are played
+# ---------------------------------------------------------------------------
+def test_sunday_night_football_belongs_to_sunday(ledger_db) -> None:
+    """**The trap in the word "today", tested as the pure conversion it is.**
+
+    An 8:20pm Eastern kickoff is 00:20 UTC the NEXT day. Filtering on the UTC
+    date drops the most-bet game of the week out of a Sunday-afternoon refresh
+    — silently, because sweeping the early games still returns quotes and still
+    looks like it worked.
+
+    Asserted against `_local_date` rather than through `upcoming_games`, because
+    that function also filters on the wall clock: a test that seeded a 1pm game
+    would pass all morning and fail every afternoon, which is a worse problem
+    than the one it is checking for.
+    """
+    from datetime import date, datetime
+
+    snf_utc = "2026-09-29T00:20:00+00:00"          # 8:20pm ET on Sunday the 28th
+    _, odds_mod = ledger_db
+
+    assert datetime.fromisoformat(snf_utc).date() == date(2026, 9, 29), (
+        "fixture is not actually spanning the UTC date boundary")
+    assert odds_mod._local_date(snf_utc) == date(2026, 9, 28), (
+        "tonight's 8:20pm game was assigned to tomorrow — the window is using "
+        "UTC dates, so every Sunday and Monday night game is invisible to the "
+        "refresh button")
+
+
+def test_an_afternoon_kickoff_is_unambiguous(ledger_db) -> None:
+    """Control. If `_local_date` returned the UTC date for everything, the test
+    above would be the only one failing and could be 'fixed' by shifting a day
+    in the wrong direction."""
+    from datetime import date
+
+    _, odds_mod = ledger_db
+    assert odds_mod._local_date("2026-09-28T17:00:00+00:00") == date(2026, 9, 28)
+
+
+def test_only_todays_games_are_charged_for(ledger_db) -> None:
+    """The reason the window narrowed: a press today must not pay for tomorrow.
+
+    Offsets are relative to now and the expectation is derived from the same
+    `_local_date` the code uses, so this means the same thing at any hour.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    db_mod, odds_mod = ledger_db
+    now = datetime.now(timezone.utc)
+    soon = (now + timedelta(minutes=90)).isoformat()
+    later = (now + timedelta(days=2)).isoformat()
+    _game(db_mod, game_id="soon", kickoff_utc=soon)
+    _game(db_mod, game_id="in_two_days", kickoff_utc=later)
+
+    today = odds_mod._local_date(soon)
+    expected = [gid for gid, k in (("soon", soon), ("in_two_days", later))
+                if odds_mod._local_date(k) == today]
+
+    ids = [g["game_id"] for g in odds_mod.upcoming_games(today_only=True)]
+    assert ids == expected, f"charged for games that are not today: {ids}"
+    assert "in_two_days" not in ids
+
+
+def test_the_scheduler_still_gets_the_full_window(ledger_db) -> None:
+    """Control. The 72-hour window is what gives CLV a price history; narrowing
+    it for the scheduler would quietly stop that, and nothing downstream would
+    complain until the closing-line numbers went strange weeks later."""
+    from datetime import datetime, timedelta, timezone
+
+    db_mod, odds_mod = ledger_db
+    now = datetime.now(timezone.utc)
+    _game(db_mod, game_id="soon", kickoff_utc=(now + timedelta(minutes=90)).isoformat())
+    _game(db_mod, game_id="in_two_days", kickoff_utc=(now + timedelta(days=2)).isoformat())
+
+    assert len(odds_mod.upcoming_games(today_only=False)) == 2
+    assert len(odds_mod.upcoming_games(today_only=False, hours=24.0)) == 1
+
+
+def test_the_manual_sweep_polls_exactly_what_it_quoted(ledger_db, monkeypatch) -> None:
+    """**The estimate is a promise, and this is what holds it to it.**
+
+    `estimate_cost` and `poll` are two functions that each decide which games
+    are in scope. If they disagree, the button says "today's 3 games, 27
+    credits" and then bills for a 72-hour sweep — an overspend that is invisible
+    because the job still succeeds and the picks still appear.
+
+    Mutation that motivated this: pointing the poll loop at the full window
+    while leaving the estimate on today left every other test in this file
+    green.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    db_mod, odds_mod = ledger_db
+    now = datetime.now(timezone.utc)
+    soon = (now + timedelta(minutes=90)).isoformat()
+    later = (now + timedelta(days=2)).isoformat()
+    _game(db_mod, game_id="soon", kickoff_utc=soon)
+    _game(db_mod, game_id="in_two_days", kickoff_utc=later)
+
+    called: list[str] = []
+
+    def _fake_event_odds(self, event_id, markets, regions, odds_format="american"):
+        called.append(event_id)
+        return {"id": event_id, "bookmakers": []}
+
+    monkeypatch.setattr(odds_mod.OddsClient, "event_odds", _fake_event_odds)
+
+    est = odds_mod.estimate_cost("props", today_only=True)
+    odds_mod.poll(force_tier="props", override_budget=True, source="manual",
+                  today_only=True)
+
+    assert len(called) == est["games"], (
+        f"quoted {est['games']} games, polled {len(called)} — the estimate and "
+        f"the sweep are using different windows")
+    assert "evt_in_two_days" not in called
+
+
+# ---------------------------------------------------------------------------
+# two caps, and the message has to say which one bit
+# ---------------------------------------------------------------------------
+def test_the_monthly_cap_binds_even_when_the_day_is_clear(ledger_db) -> None:
+    """**Why a daily cap alone protects nothing.**
+
+    At the configured 1,500/day a press every day is 45,000 a month — more than
+    the ~44,000 of headroom the scheduler leaves. The daily number limits how
+    fast you can spend; only the monthly number limits how much.
+
+    Here the day is untouched and the month is spent, so a daily-only ceiling
+    would wave this through.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from fastapi import HTTPException
+
+    db_mod, odds_mod = ledger_db
+    _game(db_mod)
+    earlier = (datetime.now(timezone.utc).replace(
+        hour=0, minute=1, second=0, microsecond=0) - timedelta(days=1)).isoformat()
+    _spend(db_mod, 1995, source="manual", when=earlier)
+
+    ledger = odds_mod.CreditLedger()
+    assert ledger.manual_used_today() == 0, "fixture spent today, not a previous day"
+    assert ledger.manual_used_this_month() == 1995
+    assert ledger.manual_remaining_today() == 5, (
+        "the day is clear but the month is spent — remaining must be the minimum")
+
+    import server
+    with pytest.raises(HTTPException) as exc:
+        server.props_refresh(admin={"username": "e"})
+    assert exc.value.status_code == 429
+    assert "month" in str(exc.value.detail), (
+        "the refusal did not name the monthly cap, so the fix is a guess "
+        "between two environment variables")
+
+
+def test_the_daily_cap_still_binds_inside_a_clear_month(ledger_db) -> None:
+    """The other direction. Both caps must be able to bite on their own."""
+    from fastapi import HTTPException
+
+    db_mod, odds_mod = ledger_db
+    _game(db_mod)
+    _spend(db_mod, 497, source="manual")      # day nearly spent, month is not
+
+    ledger = odds_mod.CreditLedger()
+    assert ledger.manual_remaining_today() == 3
+
+    import server
+    with pytest.raises(HTTPException) as exc:
+        server.props_refresh(admin={"username": "e"})
+    assert "day" in str(exc.value.detail)
+
+
+def test_remaining_is_the_minimum_of_the_two(ledger_db) -> None:
+    """Control. If `manual_remaining_today` returned the daily figure alone the
+    monthly cap would be decorative, and both tests above could be satisfied by
+    a message change with no enforcement behind it."""
+    from datetime import datetime, timedelta, timezone
+
+    db_mod, odds_mod = ledger_db
+    earlier = (datetime.now(timezone.utc).replace(
+        hour=0, minute=1, second=0, microsecond=0) - timedelta(days=1)).isoformat()
+    _spend(db_mod, 1800, source="manual", when=earlier)
+    _spend(db_mod, 100, source="manual")
+
+    # Today's spend counts against BOTH windows, which is easy to get wrong and
+    # which I did get wrong writing this test: month is 1,800 + 100 = 1,900 of
+    # 2,000, so 100 left; day is 100 of 500, so 400 left.
+    ledger = odds_mod.CreditLedger()
+    assert ledger.manual_used_this_month() == 1900
+    assert ledger.manual_used_today() == 100
+    assert ledger.manual_remaining_today() == 100

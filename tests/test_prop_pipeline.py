@@ -179,3 +179,50 @@ def test_an_implausible_edge_is_rejected_however_many_books(prop_db) -> None:
            "dispersion": MAX_CREDIBLE_DISPERSION + 0.01, "anchor": "consensus"}
     assert assign_tier(opp) is None
     assert assign_tier({**opp, "dispersion": 0.02}) is not None
+
+
+def test_the_edges_endpoint_can_actually_see_props(prop_db) -> None:
+    """**A diagnostic that cannot see the thing it diagnoses.**
+
+    `/api/edges` is where you look when props are missing. It called
+    `find_opportunities` with the default `min_books=8` — a game-market number.
+    Props cap around 7 books, live median 5, so the endpoint could never return
+    one regardless of pipeline health.
+
+    That is the 13 September bug exactly, fixed in `generate()` and left in
+    place here. On 28 September it returned 87 opportunities with zero props
+    and was read as evidence that props were broken. They were not; the
+    endpoint was blind.
+
+    Asserted as an invariant between the two callers rather than on a magic
+    number, because the number is allowed to change — the agreement is not.
+    """
+    import inspect
+
+    import server
+    from src.picks import generator
+
+    endpoint = inspect.getsource(server.edges)
+    assert "loosest_min_books" in endpoint, (
+        "/api/edges no longer uses the generator's prefilter, so it will "
+        "silently stop showing props while generate() still produces them")
+    assert "loosest_min_books" in inspect.getsource(generator.generate)
+
+
+def test_a_five_book_prop_appears_in_the_edges_endpoint(prop_db) -> None:
+    """End to end, against the real default. The test above pins the call; this
+    one proves the call does what it is for."""
+    from src.market.consensus import build_fair_prices
+
+    import server
+
+    _seed_priceable_prop(prop_db, ["pinnacle", "draftkings", "fanduel",
+                                   "caesars", "pointsbetus"], -140, 120)
+    assert build_fair_prices() > 0
+
+    out = server.edges(min_edge=1.0, admin={"username": "e"})
+    props = [e for e in out["edges"] if e["player_id"]]
+    assert props, (
+        f"a five-book prop with a real edge is invisible to /api/edges "
+        f"(min_books={out['min_books']}, {out['count']} opportunities returned)")
+    assert out["by_class"].get("prop", 0) >= 1
