@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Iterable
 
 import httpx
@@ -153,6 +154,25 @@ class CreditLedger:
     def remaining_pct(self) -> float:
         return max(0.0, 1.0 - self.used_this_month() / max(self.budget, 1)) * 100.0
 
+    def manual_used_today(self) -> int:
+        """Credits spent by manual polls since midnight UTC.
+
+        Scoped to ``source='manual'`` so the scheduler's own spend -- which has
+        its own governor in ``allows()`` -- cannot exhaust the button, and the
+        button cannot exhaust the scheduler.
+        """
+        midnight = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        row = query(
+            "SELECT COALESCE(SUM(credits_used),0) AS n FROM odds_credit_ledger "
+            "WHERE source='manual' AND called_at >= ?", (midnight,)
+        )
+        return int(row[0]["n"]) if row else 0
+
+    def manual_remaining_today(self) -> int:
+        return max(0, settings.ODDS_MANUAL_DAILY_CREDITS - self.manual_used_today())
+
     def allows(self, tier_name: str) -> bool:
         pct = self.remaining_pct()
         if pct > 30:
@@ -164,13 +184,15 @@ class CreditLedger:
         return False
 
     def record(self, endpoint: str, markets: list[str], cost: int,
-               remaining: int | None, used: int | None) -> None:
+               remaining: int | None, used: int | None,
+               source: str = "scheduler") -> None:
         with db() as conn:
             insert_row(conn, "odds_credit_ledger", {
                 "endpoint": endpoint,
                 "markets": ",".join(markets),
                 "credits_used": cost,
                 "called_at": utcnow(),
+                "source": source,
             })
         if remaining is not None and remaining < 50:
             log.warning("ODDS API CREDITS LOW: %s remaining (used %s)", remaining, used)
@@ -180,12 +202,16 @@ class CreditLedger:
 # client
 # --------------------------------------------------------------------------
 class OddsClient:
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, source: str = "scheduler"):
         self.api_key = api_key or settings.ODDS_API_KEY
         if not self.api_key:
             raise OddsAPIError("ODDS_API_KEY is not set")
         self.ledger = CreditLedger()
         self.last_remaining: int | None = None
+        # Stamped on every ledger row this client writes, so manual spend can be
+        # capped separately from the scheduler's. Defaults to "scheduler"
+        # because that is who calls this in every path that existed first.
+        self.source = source
 
     @retry(
         stop=stop_after_attempt(3),
@@ -214,7 +240,8 @@ class OddsClient:
 
         self.ledger.record(path, markets, cost,
                            self.last_remaining,
-                           int(used) if used and used.isdigit() else None)
+                           int(used) if used and used.isdigit() else None,
+                           source=self.source)
         return r.json()
 
     # ---- endpoints ----
@@ -456,9 +483,83 @@ def _hours_to_kick(kickoff: str | None) -> float:
     return (ts - datetime.now(timezone.utc)).total_seconds() / 3600.0
 
 
-def poll(force_tier: str | None = None) -> dict[str, int]:
-    """One adaptive polling pass. Called on a short interval; self-throttles."""
-    client = OddsClient()
+def _local_date(kickoff_utc: str) -> date | None:
+    """The calendar date a kickoff falls on **where the games are played**.
+
+    This is the whole difficulty in the word "today". Sunday Night Football
+    kicks at 8:20pm Eastern, which is 00:20 UTC on MONDAY. Filtering on the UTC
+    date would drop the single most-bet game of the week out of a Sunday
+    afternoon refresh, silently, and the button would look like it worked.
+
+    `settings.TZ` defaults to America/New_York for exactly this reason: the NFL
+    schedule is written in Eastern time, and every "Sunday slate" a user has in
+    mind is an Eastern-time Sunday.
+    """
+    try:
+        dt = datetime.fromisoformat(kickoff_utc)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo(settings.TZ)).date()
+
+
+def upcoming_games(today_only: bool = False, hours: float = 72.0) -> list[dict]:
+    """Games that have not kicked off, either today or inside *hours*.
+
+    Shared by the poll loop and the cost estimate so the button cannot quote a
+    price for a different set of games than the one it then polls.
+    """
+    rows = query(
+        "SELECT game_id, kickoff_utc FROM games WHERE season=? AND status!='final' "
+        "AND kickoff_utc IS NOT NULL AND datetime(kickoff_utc) > datetime('now')",
+        (settings.CURRENT_SEASON,)
+    )
+    if today_only:
+        today = datetime.now(ZoneInfo(settings.TZ)).date()
+        return [g for g in rows if _local_date(g["kickoff_utc"]) == today]
+    return [g for g in rows if _hours_to_kick(g["kickoff_utc"]) <= hours]
+
+
+def estimate_cost(tier_name: str, today_only: bool = False,
+                  hours: float = 72.0) -> dict:
+    """What one forced sweep of *tier_name* would cost, right now.
+
+    Per-event tiers are priced ``markets x regions x games``; bulk tiers are one
+    call of ``markets x regions``. This is an estimate: the API bills from the
+    ``x-requests-last`` header it returns, which is authoritative. It has
+    matched this arithmetic every time it has been checked, but the ledger
+    records the header, not this.
+    """
+    tier = next((t for t in TIERS if t.name == tier_name), None)
+    if tier is None:
+        raise ValueError(f"unknown tier {tier_name}")
+    per_call = len(tier.markets) * len(tier.regions)
+    games = len(upcoming_games(today_only, hours)) if tier.per_event else 1
+    return {"tier": tier.name, "games": games, "per_game": per_call,
+            "credits": per_call * games, "today_only": today_only}
+
+
+def poll(force_tier: str | None = None,
+         override_budget: bool = False,
+         source: str = "scheduler",
+         today_only: bool = False) -> dict[str, int]:
+    """One adaptive polling pass. Called on a short interval; self-throttles.
+
+    ``override_budget`` bypasses the monthly credit shed. It exists for the
+    admin refresh button and nothing else: the shed drops props first, which is
+    right for an unattended job and wrong for a human who wants tonight's props
+    and is spending ~108 credits against a 100,000 budget. The manual path has
+    its own, much tighter daily ceiling -- enforced by the caller, before it
+    gets here -- because this flag turns off the governor.
+
+    ``today_only`` narrows a per-event sweep to games kicking off today in
+    ``settings.TZ``. The scheduler does not use it: it wants the full 72-hour
+    window so CLV has a price history to compare against. A person pressing a
+    button an hour before kickoff wants tonight, and should not be charged for
+    next Thursday.
+    """
+    client = OddsClient(source=source)
     fetched_at = utcnow()
     totals = {"seen": 0, "written": 0, "changed": 0,
               "unmapped_events": 0, "unmapped_players": 0, "calls": 0}
@@ -499,10 +600,17 @@ def poll(force_tier: str | None = None) -> dict[str, int]:
             continue
         if tier.name == "props" and not settings.ENABLE_PROPS:
             continue
-        if not client.ledger.allows(tier.name):
+        if not client.ledger.allows(tier.name) and not override_budget:
             log.warning("credit budget: skipping tier %s (%.0f%% remaining)",
                         tier.name, client.ledger.remaining_pct())
             continue
+        if override_budget and not client.ledger.allows(tier.name):
+            # Say it out loud. A manual override that looks identical in the
+            # logs to normal operation is how a temporary exception becomes the
+            # permanent state of the system without anyone deciding to.
+            log.warning("credit budget: tier %s would be shed (%.0f%% remaining) "
+                        "— polling anyway on an explicit manual override",
+                        tier.name, client.ledger.remaining_pct())
 
         interval = tier.interval_minutes(soonest)
         if interval is None:
@@ -518,11 +626,14 @@ def poll(force_tier: str | None = None) -> dict[str, int]:
         try:
             if tier.per_event:
                 # Period markets and props 422 on the bulk endpoint — they must
-                # be requested one event at a time. Restricted to games inside
-                # 72h because cost scales with event count.
-                for g in upcoming:
-                    if _hours_to_kick(g["kickoff_utc"]) > 72:
-                        continue
+                # be requested one event at a time. Restricted by window because
+                # cost scales with event count: 72h for the scheduler, today
+                # only for a manual sweep.
+                #
+                # Built from the same helper the cost estimate uses, so the
+                # price quoted on the button and the games actually polled
+                # cannot drift apart.
+                for g in upcoming_games(today_only):
                     row = query("SELECT odds_api_event_id FROM games WHERE game_id=?",
                                 (g["game_id"],))
                     eid = row[0]["odds_api_event_id"] if row else None

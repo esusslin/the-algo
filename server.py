@@ -884,6 +884,88 @@ def _ingest_worker(step: str) -> None:
         ctx["rows_affected"] = n
 
 
+def _props_refresh_worker() -> None:
+    """Force a props poll, then reprice off it. Runs off the request path.
+
+    The chain matters and the order is not optional: fresh quotes are useless
+    until `build_fair_prices` devigs them into a fair number, and a fair number
+    is invisible until `generate` tiers it into a pick. Polling alone would
+    leave the board exactly as empty as it was, having spent the credits.
+    """
+    from src.fetchers import odds_api
+    from src.market.consensus import build_fair_prices
+    from src.picks.generator import generate
+
+    with job_run("props_refresh") as ctx:
+        ledger = odds_api.CreditLedger()
+        before = ledger.manual_used_today()
+
+        polled = odds_api.poll(force_tier="props", override_budget=True,
+                               source="manual", today_only=True)
+        priced = build_fair_prices()
+        picks = generate(source="market_engine")
+
+        spent = ledger.manual_used_today() - before
+        ctx["rows_affected"] = picks["written"]
+        ctx["note"] = (f"{spent} credits · {polled.get('written', 0)} quotes · "
+                       f"{priced} priced · {picks['written']} picks written · "
+                       f"{picks.get('withdrawn', 0)} withdrawn")
+        log.info("props refresh: %s", ctx["note"])
+
+
+@app.get("/api/admin/props-refresh")
+def props_refresh_estimate(admin: dict = Depends(auth.current_admin)) -> dict:
+    """What pressing the button would cost, before pressing it."""
+    from src.fetchers.odds_api import CreditLedger, estimate_cost
+
+    est = estimate_cost("props", today_only=True)
+    ledger = CreditLedger()
+    return {**est,
+            "manual_used_today": ledger.manual_used_today(),
+            "manual_remaining_today": ledger.manual_remaining_today(),
+            "monthly_remaining_pct": round(ledger.remaining_pct(), 1),
+            "would_be_shed": not ledger.allows("props")}
+
+
+@app.post("/api/admin/props-refresh")
+def props_refresh(admin: dict = Depends(auth.current_admin)) -> dict:
+    """Poll props now, overriding the monthly shed, under a daily ceiling.
+
+    The override is the whole point: below 30% of the monthly budget the
+    scheduler stops polling props entirely, which is correct unattended and
+    useless to someone looking at an empty props tab an hour before kickoff.
+
+    The ceiling is what makes the override safe to hand to a person. It is
+    checked HERE, before the job is queued, so a press that cannot afford
+    itself is refused out loud with a number rather than queued, run, and
+    silently shed downstream.
+    """
+    from src.fetchers.odds_api import CreditLedger, estimate_cost
+
+    est = estimate_cost("props", today_only=True)
+    ledger = CreditLedger()
+    remaining = ledger.manual_remaining_today()
+
+    if est["games"] == 0:
+        raise HTTPException(409, "no games left to kick off today — nothing to poll")
+    if est["credits"] > remaining:
+        raise HTTPException(
+            429,
+            f"manual refresh would cost {est['credits']} credits but only "
+            f"{remaining} of today's {settings.ODDS_MANUAL_DAILY_CREDITS} "
+            f"manual allowance is left. Resets at 00:00 UTC.")
+
+    scheduler.add_job(
+        _props_refresh_worker, "date",
+        run_date=datetime.now(timezone.utc),
+        id=f"props_refresh_{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=600,
+    )
+    return {"queued": "props_refresh", "estimate": est,
+            "manual_remaining_today": remaining - est["credits"],
+            "note": "polling now — refresh the picks tab in ~30s"}
+
+
 @app.post("/api/admin/ingest/{step}")
 def run_ingest(step: str, admin: dict = Depends(auth.current_admin)) -> dict:
     """Queue a data-loading step. Returns immediately; watch /health for status."""
@@ -902,8 +984,9 @@ def run_ingest(step: str, admin: dict = Depends(auth.current_admin)) -> dict:
 @app.get("/api/admin/ingest-status")
 def ingest_status(admin: dict = Depends(auth.current_admin)) -> dict:
     rows = query(
-        "SELECT job_name, status, finished_at, duration_s, rows_affected, error "
-        "FROM job_runs WHERE job_name LIKE 'ingest_%' ORDER BY id DESC LIMIT 8"
+        "SELECT job_name, status, finished_at, duration_s, rows_affected, note, error "
+        "FROM job_runs WHERE job_name LIKE 'ingest_%' OR job_name='props_refresh' "
+        "ORDER BY id DESC LIMIT 8"
     )
     counts = {}
     for t in ("games", "players", "odds_current", "fair_prices", "picks"):
@@ -930,8 +1013,14 @@ def edges(min_edge: float = 2.0) -> dict:
 
 
 @app.post("/api/admin/run/{job_id}")
-def run_job_now(job_id: str) -> dict:
-    """Manual trigger. TODO: gate behind admin auth before deploying."""
+def run_job_now(job_id: str, admin: dict = Depends(auth.current_admin)) -> dict:
+    """Manual trigger for any scheduled job.
+
+    This carried `TODO: gate behind admin auth before deploying` for the whole
+    of its deployed life. Anyone who knew the path could fire any job on the
+    box, including the polls that spend credits — so the monthly budget was
+    reachable by an unauthenticated stranger. Gated 28 September 2026.
+    """
     job = scheduler.get_job(job_id)
     if not job:
         return {"ok": False, "error": f"unknown job {job_id}",

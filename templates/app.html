@@ -559,6 +559,26 @@
         <button @click="ingest('all')" class="py-2 rounded bg-emerald-600 text-white text-xs">Load everything</button>
         <button @click="ingest('poll')" class="py-2 rounded border border-slate-600 text-xs">Refresh odds</button>
       </div>
+
+      <!-- Props are the first tier the monthly credit ladder sheds, so below 30%
+           budget the scheduler stops polling them and the props tab empties out
+           with nothing broken and nothing said. This button overrides that shed
+           deliberately, under its own daily ceiling, and states the price before
+           you press it — an override you cannot see the cost of is how a month's
+           budget disappears in an afternoon. -->
+      <div class="mt-3 pt-3 border-t border-slate-800">
+        <button @click="refreshProps()" :disabled="!propsAffordable()"
+                class="w-full py-2 rounded text-xs border"
+                :class="propsAffordable()
+                  ? 'border-emerald-600 text-emerald-400'
+                  : 'border-slate-700 text-slate-600 cursor-not-allowed'">
+          <span x-text="propsLabel()"></span>
+        </button>
+        <p class="text-xs mt-2"
+           :class="propsEst.would_be_shed ? 'text-amber-400' : 'text-slate-500'"
+           x-text="propsHint()"></p>
+      </div>
+
       <p class="text-xs text-slate-400 mt-3" x-text="busy||ingestMsg"></p>
 
       <div class="grid grid-cols-2 gap-y-1 text-xs mt-3 pt-3 border-t border-slate-800">
@@ -968,6 +988,7 @@ function algo(){return{
       const d=await(await fetch('/api/admin/invites',{headers:this.hdr()})).json();
       this.invites=d.invites||[];
       await this.loadStatus();
+      await this.loadPropsEstimate();
       try{ this.ai=await(await fetch('/api/admin/ai-usage',{headers:this.hdr()})).json() }
       catch(e){ this.ai={} }
     }
@@ -1000,6 +1021,70 @@ function algo(){return{
   },
   async loadStatus(){
     this.status=await(await fetch('/api/admin/ingest-status',{headers:this.hdr()})).json();
+  },
+  propsEst:{},
+  // Estimate before spend. Fetched when the admin tab opens and again after any
+  // refresh, so the number on the button is the number you are about to pay.
+  async loadPropsEstimate(){
+    try{
+      const r=await fetch('/api/admin/props-refresh',{headers:this.hdr()});
+      this.propsEst = r.ok ? await r.json() : {};
+    }catch(e){ this.propsEst={} }
+  },
+  propsAffordable(){
+    const e=this.propsEst;
+    return !!e.credits && e.games>0 && e.credits<=e.manual_remaining_today;
+  },
+  propsLabel(){
+    const e=this.propsEst;
+    if(!e.credits) return 'Refresh props';
+    return `Refresh props — today's ${e.games} game${e.games===1?'':'s'}, ${e.credits} credits`;
+  },
+  propsHint(){
+    const e=this.propsEst;
+    if(e.games===0) return 'No games left to kick off today.';
+    if(!e.credits) return '';
+    if(e.credits>e.manual_remaining_today)
+      return `Daily manual allowance spent (${e.manual_used_today} used). Resets 00:00 UTC.`;
+    const left=`${e.manual_remaining_today} of today's manual allowance left`;
+    // Say WHY the button matters right now. If props are being shed, the
+    // scheduler is not polling them at all and this is the only way to get them.
+    return e.would_be_shed
+      ? `Props are being shed — monthly budget at ${e.monthly_remaining_pct}%. ${left}.`
+      : `${left}.`;
+  },
+  async refreshProps(){
+    this.ingestMsg=''; this.busy='Polling props…';
+    try{
+      const r=await fetch('/api/admin/props-refresh',{method:'POST',headers:this.hdr()});
+      if(!r.ok){ this.busy=''; this.ingestMsg='Failed: '+((await r.json()).detail||r.status);
+                 await this.loadPropsEstimate(); return }
+    }catch(e){ this.busy=''; this.ingestMsg='Failed: '+e.message; return }
+    await this.pollUntilDone('props_refresh');
+    await this.loadPropsEstimate();
+  },
+  // Extracted from ingest() so both paths report completion the same way.
+  async pollUntilDone(name){
+    clearInterval(this.poller);
+    const started=Date.now(), before=JSON.stringify((this.status.recent||[])[0]||{});
+    return new Promise(resolve=>{
+      this.poller=setInterval(async()=>{
+        await this.loadStatus();
+        const top=(this.status.recent||[])[0];
+        const done = top && JSON.stringify(top)!==before && top.job_name.includes(name);
+        if(done){
+          clearInterval(this.poller); this.busy='';
+          this.ingestMsg = top.status==='success'
+            ? (top.note || `Done in ${top.duration_s}s — ${(top.rows_affected||0).toLocaleString()} rows.`)
+            : `Failed: ${top.error||'unknown'}`;
+          resolve();
+        } else if(Date.now()-started>300000){
+          clearInterval(this.poller); this.busy='';
+          this.ingestMsg='Still running after 5 min — check back shortly.';
+          resolve();
+        }
+      },3000);
+    });
   },
   async ingest(step){
     this.ingestMsg=''; this.busy='Queued — running in the background…';

@@ -147,6 +147,7 @@ def job_run(job_name: str) -> Iterator[dict[str, Any]]:
                 "duration_s": round(time.monotonic() - t0, 3),
                 "status": status,
                 "rows_affected": int(ctx.get("rows_affected") or 0),
+                "note": ctx.get("note"),
                 "error": error,
             })
 
@@ -591,6 +592,33 @@ MIGRATIONS: list[tuple[int, str]] = [
     ALTER TABLE picks ADD COLUMN review_hash TEXT;
     ALTER TABLE picks ADD COLUMN reviewed_at TEXT;
     CREATE INDEX IF NOT EXISTS idx_picks_review ON picks(result, ai_verdict);
+    """),
+    (10, """
+    -- Who spent the credit.
+    --
+    -- The scheduler sheds props first when the monthly budget runs low, which
+    -- is correct for an unattended job: props are the most expensive tier and
+    -- the least valuable when stale. But it means a human who wants props for
+    -- tonight's games cannot get them, because the same guard blocks the manual
+    -- path for a spend of ~108 credits against a 100,000 budget.
+    --
+    -- Manual polls therefore override the shed. That override needs its own
+    -- ceiling, and a ceiling needs to know which rows to count -- hence this
+    -- column. Existing rows are NULL, which reads as 'scheduler', which is what
+    -- they were.
+    --
+    -- NULL is the safe default in the opposite direction from review_hash: an
+    -- unattributed row does not count against the manual cap, so the failure
+    -- mode is a cap that is slightly too generous rather than one that locks
+    -- the button out on the strength of spending it cannot account for.
+    ALTER TABLE odds_credit_ledger ADD COLUMN source TEXT;
+    CREATE INDEX IF NOT EXISTS idx_ledger_source ON odds_credit_ledger(source, called_at);
+
+    -- A human-readable outcome for a job run. `rows_affected` is a single
+    -- integer, which cannot say '108 credits, 3 picks written, 2 withdrawn' --
+    -- and for a job a person triggers by hand and then waits on, the whole
+    -- value is being able to read what it did without opening the logs.
+    ALTER TABLE job_runs ADD COLUMN note TEXT;
     """),
 ]
 

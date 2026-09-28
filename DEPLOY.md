@@ -118,8 +118,14 @@ Then open `/app` and sign in.
 ## 6. Seed the data
 
 The scheduler will fill things in on its own cadence, but the first load is
-faster triggered manually. From the Railway shell (`railway run bash`) or via
-the admin endpoints:
+faster triggered manually. Use `railway ssh` for a shell **inside the running
+container** — not `railway run`, which executes on your own machine with
+Railway's environment variables injected. The SQLite file lives on the Railway
+volume, which is not mounted locally, and `config.py` creates a missing database
+directory rather than failing: so `railway run` against this app will either hit
+a permissions error or quietly operate on a brand-new empty database and report
+zeros for everything, which reads as total pipeline failure. Or use the admin
+endpoints:
 
 ```bash
 python -m src.fetchers.nflverse games

@@ -106,6 +106,13 @@ class Settings:
 
     # ---- budgets ----
     ODDS_MONTHLY_CREDIT_BUDGET: int = _int("ODDS_MONTHLY_CREDIT_BUDGET", 100_000)
+    # Ceiling on what the admin "refresh" button may spend per UTC day. A full
+    # 16-game props sweep is 9 markets x 1 region x 16 = 144 credits, so 500
+    # buys three full slates a day. The cap exists because the button
+    # deliberately overrides the monthly shed: without it, a stuck finger or a
+    # retry loop could spend the month in an afternoon, and the shed -- the
+    # thing that normally stops exactly that -- is the guard being bypassed.
+    ODDS_MANUAL_DAILY_CREDITS: int = _int("ODDS_MANUAL_DAILY_CREDITS", 500)
     AI_MONTHLY_BUDGET_USD: float = _float("AI_MONTHLY_BUDGET_USD", 150.0)
 
     # ---- feature flags (staged rollout — see implementation arch doc §8) ----
