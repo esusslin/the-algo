@@ -1080,7 +1080,12 @@ function algo(){return{
       {label:`Clearing ${f.min_edge_pct}% floor`,
        value:String((o.curve||[]).find(c=>c.edge===f.min_edge_pct)?.n ?? '—'),
        zero:!((o.curve||[]).find(c=>c.edge===f.min_edge_pct)?.n)},
-      {label:'Live prop picks',    value:String(p.live ?? 0), zero:!p.live},
+      // Shown WITH the withdrawn count, because an admin's board includes dark
+      // picks and a readout saying "1" next to a board showing "3" reads as a
+      // bug in one of them. It is neither: users see the 1.
+      {label:'Live prop picks',
+       value: p.withdrawn ? `${p.live ?? 0}  (+${p.withdrawn} dark)` : String(p.live ?? 0),
+       zero:!p.live},
     ];
     const first = raw.findIndex(r=>r.zero);
     return raw.map((r,i)=>({...r, dead: i===first}));

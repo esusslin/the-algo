@@ -103,5 +103,21 @@ const F = (over = {}) => ({
   t("verdict is clean", verdict.bad, false);
 }
 
+// --- the readout must reconcile with what an admin sees ------------------
+{
+  // Live on 28 September: funnel said "Live prop picks 1", the board showed 3.
+  // Both were right — an admin's board includes dark picks — but the readout
+  // gave no way to see that, so it looked like one of them was lying.
+  const { stages } = make(F({ picks: { live: 1, withdrawn: 2 } }));
+  const row = stages.find(s => s.label === "Live prop picks");
+  t("the dark count is shown alongside the live one", row.value, "1  (+2 dark)");
+  t("and 1 live is not treated as a zero stage", row.dead, false);
+}
+{
+  const { stages } = make(F({ picks: { live: 3, withdrawn: 0 } }));
+  t("no parenthetical when nothing is withdrawn",
+    stages.find(s => s.label === "Live prop picks").value, "3");
+}
+
 console.log(f ? `\n${f} FAILED` : "\nall passed");
 process.exit(f ? 1 : 0);
